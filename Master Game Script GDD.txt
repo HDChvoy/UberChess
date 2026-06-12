@@ -1,0 +1,732 @@
+ÜBERCHESS - MASTER GAME DESIGN DOCUMENT & SCRIPT
+
+By Henry David Chvoy
+
+Project Engine: Godot 4 (GDScript)
+Last Updated: June 11, 2026
+Status: Playable Alpha — All 10 power-ups implemented end-to-end. Core chess engine
+fully playable. Full AI opponent (UberBot) and three-page main menu live.
+Online multiplayer is now FULLY INTEGRATED end-to-end: the Godot client connects to
+the live Phase 1 WebSocket relay, with a lobby (create/join room), per-side board
+flip, opponent-action replay, promotion sync, disconnect handling, and rematch.
+All three modes (Local 2-Player · Vs UberBot · Online Multiplayer) are launchable
+from the menu and run.
+
+UberBot internals have advanced past the GDD's old "Stage 5" description: it now
+carries a transposition table + Zobrist hashing and piece-square tables (which
+replaced the per-leaf mobility scan). See Section 6.
+
+CURRENT FOCUS — UberBot power-up overhaul, giving it PROPER POWER-UP SEARCH EVALUATION
+instead of the old heuristic + dice layer. Built in three playable/verifiable phases:
+    Step 1 (DONE): the bot's own tactical power-ups + revive are chosen by real search.
+    Step 2 (NEXT): opponent power-ups inside the search (defend / play around threats).
+    Step 3 (LATER): coordinated multi-power-up combos + eval/economy tuning.
+See Section 6 ">>> POWER-UP SEARCH OVERHAUL <<<" and Section 11 for the full breakdown.
+
+Godot Files:  game.gd · uber_bot.gd · main_menu.gd · GameConfig.gd
+Server Files: server.js · package.json · .gitignore
+Server Repo:  https://github.com/HDChvoy/uberchess-relay
+Live URL:     wss://uberchess-relay-production.up.railway.app
+
+================================================================================
+1. THE ECONOMY SYSTEM
+================================================================================
+
+    Starting Cash: Player 1 (White) and Player 2 (Black) start with $10.
+
+    Income:
+        $2 for putting the opponent in check.
+        Piece value on capture: Pawn=$1, Knight=$3, Bishop=$3, Rook=$5, Queen=$9.
+        Capture modifiers (in priority order):
+            Negate on victim   → capturer earns $0.
+            Multiply on victim → capturer earns the boosted value (liability triggers).
+            Multiply on attacker → capturer earns the boosted value (offensive bonus).
+
+    Boost formula (Multiply):
+        Normal Pawn  → $4 (quadrupled, not doubled).
+        Super Pawn   → $16 (base $8, doubled).
+        All others   → base value × 2.
+
+    UI: Live-updating Label nodes (white_gold_label, black_gold_label) reflect
+    player_gold state. refresh_shop_affordability() is called on every gold/slot
+    change so shop button colors stay honest.
+
+================================================================================
+2. CORE MECHANIC: POWER-UP CLASSES & TURN LIMITS
+================================================================================
+
+    System: Categorized by class (Defense, Movement, Attack, Economy, Uber).
+
+    Class Limit: One ability USE per class, per turn. used_classes_this_turn tracks
+    this; it is cleared at each turn swap. Buying has no class limit — only gold
+    and slot count matter.
+
+    Exclusions:
+        - Power-ups may not target the King.
+        - Super Pawns may not receive any power-up.
+        - A piece may only carry ONE modifier per turn (no stacking across classes).
+        - Revived pieces (is_revived=true) may never be revived a second time.
+
+    Slot System (3 visible slots per side):
+        - Buying drops a power-up into a slot flagged ready=false.
+        - Slots flip to ready=true at the START of the owner's next turn (ready_slots()).
+        - A power-up is never usable on the turn it was purchased.
+        - Both players' slot rows are always visible (open information).
+        - The active player clicks a ready slot to "hold" it (held_powerup / held_slot_index),
+          then clicks a target piece. The slot is consumed on successful application only.
+
+================================================================================
+3. THE POWER-UP SHOP (10 ITEMS — ALL IMPLEMENTED)
+================================================================================
+
+    Prices are deducted at purchase; effects fire when the player later applies the
+    power-up from their slot. Duration and consumption are listed per item.
+
+    --- DEFENSE CLASS ---
+
+    Ground ($3) — Duration: 1 owner turn (expires at start of owner's next turn)
+        Effect:   The Grounded piece cannot move for one full cycle (its turn and
+                  the opponent's reply). It cannot be captured (is_invulnerable()).
+        Visual:   Brown sprite tint (modulate 0.6, 0.4, 0.2).
+        Expiry:   expire_modifiers() decrements modifier_duration; when it hits 0
+                  the modifier and tint are cleared automatically on the next
+                  spawn_visual_pieces() pass.
+        Bot logic: Used defensively on threatened high-value pieces.
+
+    Shield ($5) — Duration: 1 owner turn
+        Effect:   The Shielded piece may move freely but CANNOT capture (move-list
+                  filter removes captures in get_legal_moves when not checking_threats).
+                  It still threatens squares normally — a shielded piece CAN put the
+                  enemy King in check. It cannot be captured (is_invulnerable()).
+        Visual:   Translucent blue Polygon2D bubble + Line2D rim drawn over the piece
+                  in update_visuals() for ALL shielded pieces simultaneously.
+        Expiry:   Same expire_modifiers() system as Ground.
+        Bot logic: Used on threatened high-value pieces. Skipped if the planned move
+                   gives check (opponent can't capture during forced king resolution).
+
+    --- MOVEMENT CLASS ---
+
+    Phase ($6) — Duration: Instant (consumed at turn end by _finish_turn)
+        Effect:   The Phased piece's sliding moves pass through exactly ONE blocker per
+                  direction before stopping (get_sliding_moves with phase=true). It may
+                  tunnel through a friendly or enemy piece and continue; the second piece
+                  in that direction is a hard wall. Normal capture/invulnerability rules
+                  still apply to pieces it can land on.
+                  Threat scans use normal geometry (modifier ignored when checking_threats).
+        Visual:   Yellow translucent tint (1.0, 0.9, 0.15, 0.6).
+        Bot logic: Used to access high-value captures that normal geometry can't reach.
+
+    Teleport ($8) — Duration: Instant (consumed at turn end)
+        Effect:   The piece may relocate to ANY empty square on the board, ignoring all
+                  geometry. (get_legal_moves returns all empty squares when modifier ==
+                  "Teleport" and not checking_threats.)
+        Visual:   Purple tint (0.6, 0.2, 0.85).
+        Bot logic: Used to escape threatened positions or reach tactically useful squares.
+
+    --- ATTACK CLASS ---
+
+    Super Pawn ($10) — Duration: Permanent (is_super_pawn flag, never expires)
+        Effect:   Upgrades one of your Pawns into a Super Pawn with expanded geometry:
+                    - Move/capture straight forward OR straight backward (one square).
+                    - Capture-only on the two forward diagonals (standard pawn pattern).
+                    - En passant on the forward diagonals only.
+                  Runs in threat scans too — Super Pawn geometry defines what it threatens
+                  for check/checkmate detection.
+                  Promotion: a Super Pawn that reaches the far rank auto-promotes to Queen
+                  (shedding the is_super_pawn flag) — no picker shown.
+        Visual:   Dedicated "SuperPawn" art asset (both colors).
+        Exclusion: Cannot be applied to a non-Pawn. Super Pawns cannot receive any
+                   further power-ups.
+        Bot logic: Targets the most-advanced Pawn (highest promotion threat).
+
+    Capture ($7) — Duration: Instant (consumed at turn end)
+        Effect:   The piece gains king-style one-square moves/captures in all 8 directions
+                  on top of its normal geometry (add_capture_king_moves()). Invulnerability
+                  still blocks landing on a shielded/grounded enemy.
+        Visual:   Hot magenta tint (1.0, 0.2, 0.7).
+        Bot logic: Used when its extended range gives access to a higher-value capture
+                   than the bot's base move, and only if the resulting square is safe.
+
+    --- ECONOMY CLASS ---
+
+    Multiply ($2) — Duration: 1 owner turn
+        Effect:   When the Multiplied piece is captured, the capturer earns the boosted
+                  value (liability version). When the Multiplied piece captures an enemy,
+                  it earns the boosted value of the kill (offensive version). Both
+                  effects apply; priority is victim-mod first (see Section 1).
+        Visual:   Green tint (0.2, 0.85, 0.2).
+        Bot logic: Applied to the piece that is about to make a high-value capture when
+                   no Movement buff is in play on that piece.
+
+    Negate ($4) — Duration: 1 owner turn
+        Effect:   If the Negated piece is captured this turn, the attacker earns $0.
+                  The piece is otherwise fully functional.
+        Visual:   Red tint (0.9, 0.2, 0.2).
+        Bot logic: Applied to threatened high-value pieces to make them costly to capture.
+                   Skipped if the planned move gives check.
+
+    --- UBER CLASS ---
+
+    Cheat ($15) — Duration: Instant (consumed on use, slot freed immediately)
+        Effect:   Two-click flow. First click selects an opponent (non-King) piece;
+                  second click chooses a destination from that piece's normal move
+                  geometry (get_cheat_moves). The opponent's piece slides to the new
+                  square (animated). If the destination is occupied, the occupant is
+                  captured with no gold reward. The relocated piece is flagged as
+                  cheat_protected_square and the cheater may NOT capture it for the
+                  rest of that turn. Does NOT end the turn — the cheater still plays
+                  their own move afterward.
+        Visual:   Animated slide (same _slide_piece tween as normal moves).
+        Bot logic: Targets threatening enemy pieces, preferring those that attack a
+                   high-value bot piece. Simulates the board afterward to verify the
+                   resulting position is better, then replans the bot's own move in
+                   the new position.
+
+    Revive (Dynamic cost, $4–$18) — Duration: Permanent (is_revived flag)
+        Effect:   Not bought from the shop — triggered by clicking one of your fallen
+                  pieces in the captured tray. Entering placement mode highlights
+                  that piece type's default starting squares (only empty ones). The
+                  player clicks a highlighted square to place the piece there. The
+                  placement is rejected if it puts the owner's King in check.
+                  Revived pieces return as plain pieces (no buffs, no Super Pawn,
+                  has_moved=false, is_revived=true). A revived piece that is later
+                  captured is gone permanently — it may never be revived again.
+                  Reviving ENDS the turn (it is the owner's move).
+        Costs: Pawn=$4, Knight=$6, Bishop=$6, Rook=$10, Queen=$18.
+        Uber class gate: Shares the Uber class with Cheat — only one per turn.
+        Bot logic: Targets high-value pieces (≥5 points) the bot can afford, places
+                   them on a free original starting square, and validates the position.
+
+================================================================================
+4. COMPLETED ENGINE PHYSICS
+================================================================================
+
+    Piece DNA: Dictionary-based per-piece data stored in board_state (keyed by
+    Vector2 grid coordinate). Each entry carries:
+        type, color, has_moved, modifier, modifier_duration,
+        is_super_pawn, is_revived
+
+    Visual Modifiers: sprite.modulate implemented for Ground (brown), Phase (yellow
+    translucent), Teleport (purple), Multiply (green), Negate (red), Capture
+    (magenta). Shield uses a separate Polygon2D + Line2D bubble overlay instead of
+    a tint so the piece art shows through.
+
+    Physics Laws:
+        Castling: Fully implemented with has_moved tracking and "Safe Passage"
+            verification. King and Rook slide concurrently (parallel tweens) during
+            the animation.
+
+        En Passant: Fully implemented with transient en_passant_target ghost
+            coordinate, cleared on every non-double-pawn move.
+
+        Threat Detection: is_in_check() and get_safe_moves() (timeline simulation)
+            are active and recursion-safe. Movement modifiers (Teleport/Phase) are
+            ignored during threat scans (checking_threats=true) so check/checkmate
+            detection always uses normal geometry.
+
+        Standard Logic: Full movement geometries for all six piece types, including
+            the Super Pawn hybrid geometry.
+
+        Pawn Promotion: Interactive picker (_show_promotion_menu) — a CanvasLayer
+            overlay with TextureButton icons for Queen, Rook, Bishop, Knight using
+            the promoting player's art. execute_move() awaits the promotion_chosen
+            signal before continuing. Super Pawns and bot moves auto-promote to
+            Queen (no picker shown).
+
+        End-of-Game Detection: Unified via has_legal_moves() after each move.
+            No legal moves + in check = Checkmate. No legal moves while safe =
+            Stalemate (draw).
+
+    Power-Up Expiration System (COMPLETE):
+        expire_modifiers(color): Decrements modifier_duration on every piece of
+            `color`. When duration hits 0, modifier and duration are cleared.
+            The visual tint resets automatically on the next spawn_visual_pieces().
+            Called as control RETURNS to that player so a buff applied on turn N
+            survives the opponent's reply and expires at the start of turn N+1.
+            Duration -1 = permanent (not used currently, but supported).
+
+        One-Shot Buff Consumption: Phase, Teleport, and Capture buffs are consumed
+            at the END of the acting player's turn in _finish_turn(), regardless of
+            whether they were used. Movement buffs that modify geometry have already
+            done their job by the time the move executes, so they don't survive
+            into the reply.
+
+    Piece Animation System:
+        _slide_piece(): Spawns a visual ghost node of the moving piece and tweens
+            it from source to destination square over 0.22s (SINE ease-in-out).
+            Used by execute_move (normal moves), castling rook, and Cheat puppeting.
+        _hide_piece_at(): Hides the static board node on a given square by exact
+            board_pos meta coordinate match (robust vs. float pixel matching).
+        Captured piece fade: An independent 0.15s alpha-fade tween on the victim.
+        is_animating flag: Blocks all board input while a tween is running.
+
+================================================================================
+5. VISUAL FEEDBACK & UI (ALL FUNCTIONAL)
+================================================================================
+
+    Move Indicators: Selecting a piece renders legal destinations live —
+        green dots on empty target squares, red rings around capturable enemies.
+        Sourced from get_safe_moves(), so they automatically respect pins and check.
+        Cheat mode shows the puppeted piece's raw geometry instead.
+        All overlay nodes are tagged "dynamic_overlay" and cleared on every redraw.
+
+    Turn Indicator: On-screen TurnIndicator Label reflects game state in real time:
+        "WHITE'S TURN" / "BLACK'S TURN"  (normal play)
+        "... — Check!"  (red)   when the side to move is in check
+        "Checkmate! [Winner] wins!"  (gold)  on mate
+        "Stalemate — Draw!"  (gray)  on stalemate
+        "Revive [Type] — pick a square"  (cyan)  during revive placement
+
+    Shield Visual: Translucent blue Polygon2D + Line2D rim drawn over ALL shielded
+        pieces simultaneously (regardless of selection), so both players can read
+        the force-field state at a glance.
+
+    Bot Action Banner: A Label node ("BotActionBanner") briefly announces each bot
+        power-up action in orange text (e.g., "🤖 Used Shield on its Rook").
+        Auto-fades over ~2s via tween. Refreshed if a second action fires.
+
+    Board Coordinates: Files a–h along the bottom, ranks 1–8 down the left side
+        (a1 = White's bottom-left). Drawn as static Labels in draw_coordinates().
+
+    Left Gutter Layout: Two non-overlapping vertical bands in the left gutter.
+        Each band (Black above, White below) stacks: Bank Label → Power-Up Slots
+        heading → Slot buttons (×3) → Captured heading → Captured-piece icon grid.
+        Slot buttons color: gray=locked, green=ready, gold=currently held.
+        Captured icons are clickable TextureButtons that trigger revive flow.
+
+    Shop: Static right-side UI. Affordability colors update live:
+        bright green = can buy (slot free + enough gold)
+        dim red-gray  = blocked (no slot or insufficient gold)
+        cyan          = Revive (dynamic cost, special behavior)
+        gold          = the item currently in hand (selection overrides all)
+
+    Pawn Promotion Picker: CanvasLayer modal with a dark backdrop and four
+        TextureButton choices (Queen/Rook/Bishop/Knight) using the promoting
+        player's piece art. Fires a promotion_chosen signal; execute_move awaits it.
+
+    Input Lock: game_over and is_animating flags disable board input during
+        end-of-game and piece slide tweens respectively.
+
+================================================================================
+6. BOT SYSTEM — ÜBERBOT (uber_bot.gd)
+================================================================================
+
+    Architecture: RefCounted class (UberBot), instantiated in game.gd _ready()
+    as `bot = UberBot.new(self)`. Receives a reference to the game node and reads
+    board_state, player_gold, powerup_slots, etc. directly.
+
+    Search Algorithm (current):
+        Iterative Deepening: Depth 1, 2, 3 … up to MAX_DEPTH. Each completed
+            depth refines best_move; a depth aborted mid-way is discarded so
+            the bot always returns the fully-searched result.
+        Alpha-Beta Negamax (_negamax): Standard fail-soft negamax pruning. The ROOT
+            uses a FULL window (not a narrowed alpha-beta window) so every root move
+            gets its exact score — required for the "tied moves" opening-variety list
+            to be honest (a narrowed window would let a blunder tie with a real move).
+        Transposition Table + Zobrist Hashing (_tt, _hash, _zkeys): A Zobrist key is
+            maintained incrementally by _make/_unmake (make XORs piece/EP/side deltas;
+            unmake restores the snapshot stored in the undo record). _negamax probes
+            _tt by hash: an entry deep enough returns directly on EXACT / cutting
+            LOWER / UPPER bounds, and otherwise still supplies a best-move hint for
+            ordering. The table is cleared at the top of every _best_move. A piece's
+            Zobrist signature includes its modifier + super-pawn state, so a buffed or
+            Super piece never collides with a plain one on the same square.
+        Quiescence Search (_quiescence): At the depth limit, continue searching
+            captures-only until the position is quiet (max QUIESCENCE_CAP=6 extra
+            plies). Eliminates horizon-effect blunders like "grab the queen, miss
+            the recapture."
+        Move Ordering: TT best-move first, then captures sorted by MVV-LVA (victim
+            value × 10 − attacker value), then killer moves (quiet moves that caused
+            cutoffs) promoted ahead of other quiet moves.
+        Make/Unmake: _make() / _unmake() mutate board_state in place and perfectly
+            reverse, handling captures, en passant, castling rook shift, promotion,
+            the EP trail, AND the running Zobrist hash. No board duplication, so deep
+            search is affordable.
+
+    Evaluation (_evaluate): Material + position (piece-square tables) + power-up
+        state + economy. O(1) per piece — no move generation in the leaf.
+        Material: Standard piece values (centipawn-ish; pawn ≈ 100).
+        Super Pawn premium: 850 centipawns (near-Queen threat).
+        Shield bonus: +120 (hard to remove).
+        Ground bonus: +60 (invulnerable but frozen).
+        Position: Piece-square tables (_PST / _pst_bonus) per piece type, written from
+            White's perspective and mirrored vertically for Black. Encodes development,
+            centralization, rook-on-7th, and a tucked/castled middlegame king.
+            NOTE: the PST replaced BOTH the old center/pawn-push proxies AND the old
+            per-leaf mobility scan. Mobility weighting is GONE — the legal-move
+            generation it required on every leaf for every piece was throttling search
+            depth. There is no MOBILITY_WEIGHT term anymore.
+        Economy: GOLD_WEIGHT × gold lead; GOLD_HOARD_BONUS for sitting on ≥ a Cheat's
+            price (symmetric — the opponent hoarding subtracts the same).
+
+    Variety: Randomizes only among genuinely tied root moves (within TIE_EPSILON
+        = 0.5), and only during the first OPENING_PLIES = 6 half-moves. Plays
+        sharply everywhere else.
+
+    Difficulty (set from GameConfig, read in _init()):
+        Easy:   depth 2, 400ms budget.
+        Normal: depth 4, 1200ms budget.
+        Hard:   depth 6, 2500ms budget (original hardcoded values).
+        Über:   depth 8, 4000ms budget.
+        Logic is identical across difficulties; only the search ceiling changes.
+
+    Turn Planning (plan_turn):
+        Returns an ordered action list: [optional power-up uses, ≤1 per class]
+        + [optional buy] + [move OR revive]. game.gd iterates the plan and
+        executes each action with per-step delays (1.5s between power-up uses,
+        1.6s thinking pause before the plan starts).
+
+        Power-up targeting:
+            Cheat / Revive: evaluated first (Uber class). Cheat simulates the
+                board after the relocation and replans the bot's move in the
+                improved position; saved_board / saved_ep / saved_cps are
+                snapshot-restored after planning.
+            Capture / Phase / Teleport: scored by victim value beyond the
+                baseline move gain; highest-gain reshaper wins.
+            Super Pawn: targets the most advanced Pawn not already a Super Pawn.
+            Multiply: applied to the mover when it's about to take a high-value
+                piece and no Movement buff is in play on that piece.
+            Negate / Shield / Ground: evaluated AFTER simulating the bot's own
+                move on the board (post-move undo) so it doesn't waste a buff on a
+                piece whose only attacker is the one the bot just captured.
+                Skipped entirely if the planned move gives check.
+
+        Fallback: _bot_fallback_move() guarantees the turn advances even if
+            plan_turn produces no executable terminal action.
+
+    >>> POWER-UP SEARCH OVERHAUL (PHASED — STEP 1 DONE, STEPS 2-3 PENDING) <<<
+
+        Goal: give the UberBot proper power-up evaluation by SEARCH instead of heuristics
+        + dice. Built in three playable/verifiable phases:
+            Step 1 (DONE): the bot's OWN power-ups, chosen by search. Kills the dumb
+                revives and coin-flip captures — every power-up play becomes calculated.
+                Biggest behaviour jump, most contained.
+            Step 2 (PENDING): opponent power-ups inside the search, so the bot defends
+                and plays around the player's threats. Needs branching control + tuning.
+            Step 3 (PENDING): coordinated multi-power-up tactics + eval/economy tuning —
+                Cheat/Multiply/combos as part of a real plan, saving gold with intent.
+                This is where it starts feeling like an ÜberChess opponent that hunts you.
+
+        --- STEP 1 — AS IMPLEMENTED (uber_bot.gd) ---
+        Architecture: a ROOT-LEVEL power-up search, deliberately NOT a full negamax
+        restructure (keeps the proven pure-chess search untouched and the phase
+        verifiable). plan_turn() now:
+            1. _best_move() finds the plain best move (deep search, unchanged).
+            2. _gen_powerup_candidates() proposes a small set of candidate TURNS using the
+               existing target helpers as generators: each ready tactical power-up applied
+               to its best target, paired with a terminal move, plus a revive per
+               affordable/safe fallen piece, plus the plain move as the baseline.
+            3. _choose_primary() SCORES every candidate with _score_turn(): apply the turn,
+               run the real opponent-reply negamax to _candidate_depth() (= clamp(MAX_DEPTH
+               -2, 2, 6)) with an ISOLATED fresh TT + re-seeded hash, then revert. The best
+               candidate wins only if it beats the plain move by PU_SEARCH_MARGIN (12 cp).
+               Its own time budget is reset (_deadline_us) so candidates don't insta-timeout.
+            4. The chosen turn is emitted in game.gd's existing action shapes (pre-move
+               uses first, terminal move/revive last).
+        Make/unmake power-up support (_apply_turn / _revert_turn): reversibly applies the
+        Super Pawn flag, Shield/Ground modifier, and Revive (board + gold + captured tray +
+        EP). OFFENSIVE buffs (Capture/Phase/Teleport) need NO make/unmake support — for
+        scoring they reduce to the plain _make(from->to), since the resulting position is
+        identical whether or not the (turn-end-consumed) modifier is set; the buff only
+        unlocked the geometry the generator already found.
+        Searched (now calculated, no dice): Capture, Phase, Teleport, Super Pawn, Shield,
+        Ground, Revive.
+        Still heuristic for now (deliberately deferred): Cheat (Uber, reshapes the board —
+        Step 3 coordination), and the economy buffs Multiply / Negate + BUYING. Their value
+        is gold INCOME, which make/unmake doesn't model yet, so a pure search would only
+        ever see gold go down and never use/buy them. These stay on the existing USE_PROB /
+        BUY_CHANCE heuristics, layered onto the search-chosen move via _layer_economy().
+        Scope notes / known approximations (fine for Step 1, addressed later):
+            - Opponent plays pure chess in the candidate search (Step 2 adds its power-ups).
+            - Only one tactical power-up per searched turn (multi-buff COMBOS are Step 3);
+              the economy heuristic can still add a Multiply/Negate on top, as before.
+            - Shield/Ground modifiers don't expire inside the candidate's deep search, so
+              their protection is very slightly over-valued at depth. The +bonus already
+              models "hard to remove"; precise in-search expiry is a Step 2/3 refinement.
+            - Cheat fires before the search and spends Uber, so it pre-empts revive that
+              turn; smarter cheat-vs-revive arbitration is Step 3.
+            - Power-up evaluation gets its own think budget, so a bot turn can take up to
+              ~2x MAX_THINK_MS worst case (usually far less — candidates are few/shallow).
+
+        POST-STEP-1 FIXES (from first playtest):
+            - BUG (game.gd, the real one): the bot used NO power-ups at all. Root cause was
+              the single-player shop lock in _on_shop_item_pressed — "if vs_bot and
+              current_turn == bot_color: return" — which also rejected the bot's OWN buys via
+              _bot_buy (it runs on the bot's turn). No buys -> no ready slots -> the Step-1
+              search had nothing to use. Fixed with a bot_buying flag (mirrors
+              net_applying_remote): _bot_buy sets it around its _on_shop_item_pressed call,
+              and the guard now reads "...and not bot_buying". Human shop stays locked during
+              the bot's turn. This was a pre-existing game.gd bug, surfaced by Step 1.
+            - SYMPTOM (uber_bot.gd): with no power-ups firing, every turn collapsed to the
+              plain best move, and the PST made knight development the top opening move, so
+              the bot robotically shoved out both knights. Mostly resolves once power-ups flow
+              again. Also softened directly: _best_move now keeps per-move scores at the last
+              completed depth and, for the first OPENING_PLIES, randomizes among ALL root
+              moves within OPENING_VARIETY_CP (35cp) of the best — not just exact ties — so
+              near-equal developing moves trade off. best_move stays exact for later play and
+              search ordering. (Replaced the old narrow best_tied/TIE_EPSILON variety list.)
+
+        STEP 2 / STEP 3 — open design questions to settle next:
+            - Opponent power-ups: branch power-up actions for BOTH sides (drop the
+              root-color gate), with ordering/pruning to control the larger tree.
+            - Economy modelling: credit capture INCOME (incl. Multiply/Negate effects) and
+              future-slot value in make/unmake + eval, so buying and Multiply/Negate can be
+              searched rather than rolled.
+            - In-search modifier expiry + gold/slots in the Zobrist hash once power-up state
+              varies at non-root plies (then candidates can share one TT safely).
+            - Multi-buff combos as first-class plans; intentional gold saving.
+
+
+================================================================================
+7. MATCH CONFIGURATION (GameConfig.gd — AUTOLOAD)
+================================================================================
+
+    Singleton registered at Project > Project Settings > Autoloads as "GameConfig".
+    Survives scene swaps (menu → game). main_menu.gd writes to it; game.gd and
+    uber_bot.gd read from it in _ready() / _init().
+
+    Mode enum: TWO_PLAYER · VS_BOT · MULTIPLAYER
+
+    Bot settings (VS_BOT mode):
+        bot_color: which side the AI plays (randomized each game).
+        player_color: which side the human plays.
+        roll_bot_sides(): randomizes sides on each new bot match.
+
+    Difficulty enum: EASY · NORMAL · HARD · UBER
+        DIFFICULTY_PRESETS dictionary maps each tier to {depth, think_ms, label}.
+        bot_max_depth() and bot_think_ms() accessors used by UberBot._init().
+
+    Helper methods: set_two_player(), set_vs_bot(diff), is_bot_match().
+
+================================================================================
+8. MAIN MENU (main_menu.gd)
+================================================================================
+
+    Set as the project's Main Scene. Navigates via three full-rect CenterContainer
+    pages toggled by visibility (no scene changes between pages).
+
+    Page 1 — Main: Play Local · Multiplayer · Options · Credits · Quit
+    Page 2 — Local: Play 2-Player · Play Über Bot · ← Back
+    Page 3 — Difficulty: Easy · Normal · Hard · Über · ← Back
+
+    "Play 2-Player" calls GameConfig.set_two_player() then loads Game.tscn.
+    "Play Über Bot" → difficulty page; selecting a tier calls GameConfig.set_vs_bot(diff)
+        (randomizes sides) then loads Game.tscn.
+    "Multiplayer" calls GameConfig.set_multiplayer() then loads Game.tscn; game.gd reads
+        is_multiplayer() in _ready(), shows the lobby, and opens the relay connection.
+        (This is now fully wired — no longer a stub.)
+    Options / Credits remain stubs (print-only, not yet built).
+    Quit calls get_tree().quit().
+
+    UI built entirely in GDScript (no .tscn layout nodes). Each page is a
+    full-rect CenterContainer wrapping a VBoxContainer of 320×56 buttons, over a
+    soft dimmed-chessboard backdrop that mirrors the online lobby's darkened board.
+
+================================================================================
+9. MULTIPLAYER BACKEND — PHASE 1 (LIVE ✅)
+================================================================================
+
+    Architecture Decision:
+        ENet (Godot's built-in P2P) was evaluated and rejected — it requires one
+        player to host (exposes their IP), does not work with Godot's web export,
+        and has no path to matchmaking or user accounts. It is a dead end for the
+        Chess.com long-term vision.
+
+        WebSocket relay was chosen instead: a central server both players connect
+        to. The server passes messages between clients without understanding chess.
+        All move validation stays in the Godot clients for Phase 1 (trusted peers).
+        Phase 2 will move validation to the server.
+
+    Server Stack:
+        Runtime:  Node.js v24.16.0
+        Library:  ws ^8.18.0 (WebSocket server)
+        File:     server.js (~60 lines)
+        Hosting:  Railway (auto-deploys on every git push to main branch)
+
+    Live Endpoints:
+        HTTPS:    https://uberchess-relay-production.up.railway.app  (shows
+                  "Upgrade Required" in browser — correct, it's WS-only)
+        WSS:      wss://uberchess-relay-production.up.railway.app    (use this
+                  in Godot and any WebSocket client)
+
+    GitHub Repo:
+        URL:      https://github.com/HDChvoy/uberchess-relay
+        Branch:   main
+        Files:    server.js · package.json · .gitignore
+        Deploy:   Railway watches the repo; any `git push origin main` triggers
+                  an automatic redeploy with zero downtime.
+
+    Message Protocol (all JSON):
+        Client → Server:
+            { "type": "CREATE_ROOM" }
+                Server assigns a 6-character alphanumeric room code and responds
+                with ROOM_CREATED. The creating player is assigned White.
+
+            { "type": "JOIN_ROOM", "code": "KVTCLJ" }
+                Server pairs the joiner as Black and fires MATCH_START to both
+                players. Returns ERROR if the code is invalid or the room is full.
+
+            { "type": "MAKE_MOVE",         "from": [x,y], "to": [x,y] }
+            { "type": "USE_POWERUP",       "item": "Shield", "target": [x,y] }
+            { "type": "BUY_ITEM",          "item": "Ground" }
+            { "type": "REVIVE",            "index": 0, "tile": [x,y] }
+            { "type": "CHEAT_MOVE",        "from": [x,y], "to": [x,y] }
+            { "type": "PROMOTION_CHOSEN",  "piece_type": "Queen" }
+            { "type": "REMATCH" }
+                Sent when a player clicks Rematch after a game ends; relayed to the
+                opponent (who receives it as REMATCH). When both sides have sent it,
+                each client resets to a fresh game in the same room (see Section 9
+                "CLIENT — REMATCH"). NOTE: verify server.js forwards REMATCH — it is in
+                the same pure-relay category as the action messages above.
+                All of the above are pure relay — the server forwards them to the
+                opponent unchanged. The server does not validate chess rules.
+
+        Server → Client:
+            { "type": "ROOM_CREATED",          "code": "KVTCLJ" }
+            { "type": "MATCH_START",           "your_color": "White" | "Black" }
+            { "type": "OPPONENT_DISCONNECTED" }
+            { "type": "ERROR",                 "message": "Room not found" |
+                                                           "Room is full" }
+
+    Room lifecycle:
+        - Rooms live in a server-side Map (in memory, no database).
+        - A room is created on CREATE_ROOM and deleted when either player disconnects.
+        - Rooms are not persistent — a disconnection ends the match. Reconnection
+          is a Phase 2 concern.
+        - The server logs all room events to stdout (visible in Railway's log viewer).
+
+    Cost:
+        Railway gives $5/month free compute credit. A WebSocket relay server
+        doing nothing but routing messages uses ~$0.05–0.10/month at launch scale.
+        Effectively free until meaningful traffic arrives.
+
+    Confirmed Working (tested June 8, 2026):
+        - Local test (ws://localhost:8080): CREATE_ROOM → ROOM_CREATED ✅
+        - Live test (wss://uberchess-relay-production.up.railway.app):
+          CREATE_ROOM → ROOM_CREATED ✅
+        - Both clients pairing → MATCH_START sent to both ✅
+
+    CLIENT INTEGRATION — DONE / LIVE (game.gd, Section "5.5 NETWORKING"):
+        The Godot client is fully wired to the live relay. What's built:
+            1. WebSocketPeer connection (SERVER_URL) opened in _ready() when
+               is_multiplayer; _process() polls the socket every frame, detecting
+               OPEN/CLOSED once each and draining inbound packets.
+            2. Lobby overlay (_build_lobby_ui): "Create Room" (shows the returned
+               room code), a 6-char code field + "Join Room" (Enter submits), live
+               status line, and a Back-to-Menu button. Buttons enable on socket OPEN.
+            3. send_to_server() — single outbound chokepoint. No-ops unless online with
+               an OPEN socket AND not currently replaying a remote action (the
+               net_applying_remote guard is what stops an opponent action from being
+               echoed back). Injected into execute_move, apply_powerup, _on_shop_item_
+               pressed (buy), _do_revive, execute_cheat_move, and the promotion flow.
+            4. Inbound routing (_net_route) + ordered replay: server-control messages
+               (ROOM_CREATED / MATCH_START / ERROR / OPPONENT_DISCONNECTED / REMATCH)
+               and PROMOTION_CHOSEN are handled immediately; chess-action messages are
+               queued in _net_inbox and drained one at a time by _pump_inbox(), each
+               fully awaited (animation included) before the next — this serializes
+               concurrent remote coroutines and prevents the board-mutation corruption
+               that plagued early bot turns. PROMOTION_CHOSEN is handled out-of-band
+               (buffered AND emitted) so a replay parked on `await promotion_chosen`
+               can't deadlock the pump.
+            5. _apply_remote_action replays each opponent action by calling the SAME
+               local function the human uses, with net_applying_remote=true. For
+               slot-consuming actions it reconstructs the slot via _find_ready_slot
+               (the wire carries the item name, not the slot index).
+            6. Input gating: board input is locked until MATCH_START
+               (net_match_started) and, on the opponent's turn, gated by
+               `current_turn != my_side` in _input / buy / powerup / revive paths.
+            7. Per-side board flip: MATCH_START sets my_side and board_flipped (Black
+               views the board rotated 180°). Implemented as a pure VIEW transform
+               (_disp) — board_state, all move logic, and the wire protocol always use
+               LOGICAL coords, so flipping the view can never desync. (This view path
+               is shared with Vs-Bot so the human always sits on the bottom.)
+            8. OPPONENT_DISCONNECTED / lost connection → _show_net_notice ends the match
+               gracefully.
+        Room creator is White, joiner is Black, confirmed via MATCH_START's your_color.
+
+    CLIENT — REMATCH (game.gd):
+        When an online game ends, _show_rematch_ui() offers Rematch / Return to Menu
+        without dimming the final position. Clicking Rematch sends {"type":"REMATCH"}
+        and sets rematch_local; receiving the opponent's REMATCH sets rematch_remote.
+        When both are true, _do_rematch() resets all gameplay state to the opening
+        position in the SAME room (colors kept, White to move) — it runs identically on
+        both clients, so post-reset state stays in sync with no extra coordination.
+
+================================================================================
+10. MULTIPLAYER VISION — PHASE 2 (FUTURE / Chess.com-like)
+================================================================================
+
+    The relay server is deliberately minimal for Phase 1. Phase 2 adds the
+    following layers on top of the same server without breaking existing clients:
+
+    User Accounts + Auth:
+        - REST API endpoints for register / login / profile.
+        - JWT tokens issued on login, sent with every WebSocket connection.
+        - Persistent username, avatar, game history.
+
+    Rating System:
+        - Glicko-2 algorithm (better than ELO for players with few games).
+        - Rating updated after every ranked match result.
+        - Leaderboard endpoint.
+
+    Matchmaking Queue:
+        - Players join a queue instead of sharing a room code.
+        - Server pairs players within a rating band.
+        - Falls back to wider band after a timeout.
+
+    Game History + Replay:
+        - PostgreSQL database records every move of every completed game.
+        - Replay viewer: step through any past game move-by-move.
+
+    Server-Side Move Validation (KEY Phase 2 milestone):
+        - Port GDScript move validation logic (get_safe_moves, is_in_check, etc.)
+          into the server language (JavaScript or Python).
+        - Server rejects illegal moves before relaying them. Clients cannot cheat.
+        - This is the architectural requirement for a public Chess.com-like platform.
+
+    Spectator Mode:
+        - Additional WebSocket clients can subscribe to a room as read-only.
+        - Server broadcasts all moves to spectators as well as players.
+
+    Web Client (optional):
+        - A browser-based client (React or plain JS) that connects to the same
+          WebSocket server and REST API — no Godot required.
+        - Godot remains the mobile/desktop client; the web client is a lightweight
+          alternative for casual play.
+
+================================================================================
+11. PENDING / TO-DO
+================================================================================
+
+    UberBot Power-Up Search Overhaul — STEP 2 (IMMEDIATE NEXT PRIORITY):
+        Phased plan in Section 6 ">>> POWER-UP SEARCH OVERHAUL <<<".
+        Step 1 (bot's own power-ups chosen by search) is DONE. Next is Step 2: put the
+        OPPONENT's power-ups into the search so the bot defends and plays around the
+        player's threats — needs branching control and tuning. Step 3 (coordinated
+        multi-power-up combos + eval/economy tuning) follows.
+
+    DONE since last GDD revision (kept here briefly for history):
+        - Multiplayer Godot client integration — COMPLETE (Section 9 "CLIENT
+          INTEGRATION"). Lobby, relay connection, ordered remote replay, promotion sync,
+          input gating, disconnect handling, and rematch all live.
+        - Board flip — COMPLETE. Implemented as a general _disp view transform: online
+          Black views rotated 180°, and Vs-Bot puts the human on the bottom. Local
+          2-player hot-seat intentionally stays White-perspective (board_flipped false).
+        - UberBot transposition table + Zobrist hashing — COMPLETE (Section 6).
+        - UberBot piece-square tables replacing the per-leaf mobility scan — COMPLETE
+          (Section 6 Evaluation).
+
+    Options Screen (FUTURE):
+        Volume, board theme, and other settings. Button exists in main menu
+        but no panel is built.
+
+    Credits Screen (FUTURE):
+        Button exists in main menu but no panel is built.
+
+    iOS / App Store Pipeline (ACTIVE):
+        Godot → Xcode → App Store export. Fairy Stockfish integration via
+        GDExtension is a stretch goal for a stronger base engine option.
+
+    Super Pawn Art / App Icon:
+        The Super Pawn is intended as the central visual identity element and
+        app icon. Final icon asset pass pending.

@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://2g5ckyk4shs7"]
+
+[ext_resource type="Script" uid="uid://qye38fwat2pq" path="res://game.gd" id="1_wbfu4"]
+
+[node name="Game (UberChess)" type="Node2D" unique_id=751297383]
+script = ExtResource("1_wbfu4")

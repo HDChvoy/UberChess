@@ -1,0 +1,21 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# Export builds (binaries go up as GitHub Releases, not in the repo)
+builds/
+*.exe
+*.pck
+*.apk
+*.aab
+*.ipa
+
+# macOS junk
+.DS_Store
+
+# Windows junk
+Thumbs.db
+desktop.ini
+
+# Visual Studio Code
+.vscode/
