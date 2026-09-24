@@ -19,3 +19,6 @@ desktop.ini
 
 # Visual Studio Code
 .vscode/
+
+# Local helper scripts
+push_to_github.bat

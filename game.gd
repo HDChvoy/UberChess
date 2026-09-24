@@ -6,21 +6,29 @@ extends Node2D
 
 # --- ECONOMY & SHOP DATA ---
 var player_gold = {"White": 10, "Black": 10}
-# Pieces each side has captured (for the trays by each bank). Each entry:
-# {"color": <captured piece's color>, "type": ..., "is_super_pawn": bool}
-var captured_pieces = {"White": [], "Black": []}
+# THE BENCH — each side's OWN fallen pieces, waiting to be tapped back in.
+# Note the ownership direction, which the old "captured_pieces" name had backwards:
+# record_capture files a victim under the VICTIM's color, so bench["White"] is WHITE'S
+# losses, not what White has taken. Each entry: {"type": <str>, "is_super_pawn": bool}.
+# Pieces tapped OUT land here too, so a piece can rotate on and off the board any
+# number of times — the sub budget below is the limiter, not a per-piece flag.
+var bench = {"White": [], "Black": []}
+# Substitutions remaining this match, per side. The only irreversible resource in the
+# game: spent by _do_tapin, never refunded, reset only by _do_rematch.
+const SUBS_PER_MATCH := 3
+var subs_left = {"White": SUBS_PER_MATCH, "Black": SUBS_PER_MATCH}
 var white_gold_label = Label.new()
 var black_gold_label = Label.new()
 var powerup_classes = {
-	"Phase": "Movement", "Teleport": "Movement",
+	"Phase": "Agility", "Teleport": "Agility",
 	"Super Pawn": "Attack", "Capture": "Attack",
 	"Ground": "Defense", "Shield": "Defense",
 	"Multiply": "Economy", "Negate": "Economy",
-	"Revive": "Uber", "Cheat": "Uber"
+	"Tap-In": "Uber", "Cheat": "Uber"
 }
 var powerup_costs = {
 	"Ground": 3, "Shield": 5, "Phase": 6, "Teleport": 8,
-	"Super Pawn": 10, "Capture": 7, "Multiply": 2, "Negate": 4, "Cheat": 15, "Revive": 0
+	"Super Pawn": 10, "Capture": 7, "Multiply": 2, "Negate": 4, "Cheat": 15, "Tap-In": 0
 }
 # How many of the OWNER'S upcoming turns a buff survives into.
 # 1 = lasts through the opponent's single reply, then expires when control returns.
@@ -34,7 +42,7 @@ var en_passant_target = Vector2(-1, -1) # -1,-1 means no ghost trail exists righ
 
 # --- SHOP STATE & MEMORY ---
 var held_powerup = "" # Stores the name of the item currently being dragged
-var used_classes_this_turn = [] # Remembers if we already bought 'Defense', 'Movement', etc.
+var used_classes_this_turn = [] # Remembers if we already bought 'Defense', 'Agility', etc.
 var shop_buttons = {}
 
 # --- POWER-UP SLOTS (shared-visibility inventory) ---
@@ -52,16 +60,43 @@ var is_animating = false  # true while a piece slide tween is running; blocks in
 var winner = ""
 var is_draw = false  # true on stalemate (or other draws later)
 var in_check = false  # true when the side to move is currently in check
-# When a revive is awaiting tile placement, holds {owner, index, type, cost, candidates}.
-# Empty dict means no revive is in progress.
-var revive_pending = {}
+var won_by_king_capture = false  # true when the game ended by physically taking a King
+# --- RESIGNATION ---
+# Resigning is a terminal action available at any time (your clock or the opponent's),
+# gated behind a confirm dialog so it can never be a mis-click. Online it is broadcast
+# so both clients end the match identically. `resigned_color` is the side that gave up.
+var won_by_resignation = false   # true when the game ended because someone resigned
+var resigned_color = ""          # which side threw in the towel
+var _resign_button: Button = null
+var _confirm_open := false       # true while a modal confirm dialog is up — blocks board input
+# When a bench piece is armed and waiting for the piece it will replace, holds
+# {owner, index, type, targets}. `targets` is the pre-filtered list of that side's own
+# board squares this bench piece may legally and affordably swap onto — cost varies per
+# target, so it is looked up at draw/commit time rather than cached here.
+# Empty dict means no tap-in is in progress.
+var tapin_pending = {}
+var tapin_selecting := false  # true when player clicked Tap-In in shop — bench pieces glow
 
 # --- AI OPPONENT ---
 # These defaults are overridden in _ready() by GameConfig (set from the main menu).
 # Kept as sane fallbacks so the scene still runs if launched directly in the editor.
 var vs_bot := true        # set from GameConfig.is_bot_match()
 var bot_color := "Black"  # set from GameConfig.bot_color
-var bot                   # the UberBot instance
+var bot                   # the UberbotStrategy instance (owns the UberBot search engine)
+
+# The bot's ENTIRE turn is budgeted to this many seconds of wall-clock, measured from
+# the moment your move ends to the moment the bot's final (turn-ending) action fires.
+# One-action and three-action turns therefore feel identical from the outside — the
+# actions are spread evenly across the budget instead of each adding a fixed delay.
+# The blocking plan_turn() search is spent FROM this budget, not added on top of it.
+# See GDD 6.5: FX beats must overlap these gaps, never extend them.
+#
+# The authoritative value lives on GameConfig, because UberbotStrategy sizes its veto pass
+# against the same number and the two must not drift. This const is the fallback for an
+# editor-direct launch with no autoload; _ready() overwrites bot_turn_seconds when the
+# singleton is present.
+const BOT_TURN_SECONDS := 4.0
+var bot_turn_seconds := BOT_TURN_SECONDS
 
 # --- ONLINE MULTIPLAYER (Phase 1 WebSocket relay) ---
 # The game connects to a central relay (wss URL below). The relay forwards messages
@@ -102,27 +137,107 @@ var _lobby_join_btn: Button = null
 const TILE_SIZE = 100
 const BOARD_OFFSET = Vector2(300, 100)
 
+# --- AESTHETIC: BACKGROUND & FONTS ---
+# Deep slate from the same stone family as the shop panel (Color(0.22,0.22,0.29)),
+# pulled a touch darker so the shop still reads as a raised element against it.
+const BG_COLOR := Color(0.16, 0.16, 0.21)
+
+# Pixel-font typography. Drop these four .ttf files into res://fonts/ (already named
+# to match). Each missing file degrades gracefully to the default font, so a fresh
+# checkout never crashes. Roles:
+#   body    — Merchant Copy: clean typewriter pixel, used for ALL UI text everywhere.
+#   accent  — 3D-Thirteen: extruded arcade look, used for the in-game turn banner.
+#   heading — CoralPixels: pixel-serif, lent to body as a glyph fallback (Merchant
+#             Copy has no "Ü", so missing glyphs are pulled from here automatically).
+# --- FONTS ---
+# All in-game UI text uses Poxast (same display font as the menu "ÜBERCHESS" wordmark).
+# Merchant Copy is chained as a per-glyph fallback. Turn banner keeps its accent font.
+const FONT_UI_PATH       := "res://text fonts/poxast/Poxast-Regular.ttf"          # ← MATCH main_menu.gd EXACTLY
+const FONT_FALLBACK_PATH := "res://text fonts/merchant-copy/Merchant Copy.ttf"    # glyph fallback only
+const FONT_ACCENT_PATH   := "res://text fonts/3d-thirteen-pixel-fonts/3D-Thirteen-Pixel-Fonts.ttf"  # banner only
+const UI_FONT_SCALE := 0.85  # one dial: global size multiplier for all in-game text
+
+var font_body: Font = null    # resolved UI font every text node uses (Poxast, or the fallback)
+var font_accent: Font = null  # turn banner only
+# PROSE font — Merchant Copy, the clean typewriter pixel. Poxast is a display face: it
+# is wide, heavy and hard to read once a string runs past a few words, which is fine for
+# "Ground $3" and bad for a four-line power-up description. Anything that is a SENTENCE
+# rather than a label uses this instead. Currently: the shop tooltip.
+var font_prose: Font = null
+
+# --- EFFECTS (fx.gd, GDD Section 6) ---
+# game.gd calls fx.play("name", square) and knows nothing about how it is drawn.
+# Null-guard every call: the module is optional by design, so a missing or broken
+# fx.gd degrades to the old silent game rather than taking the match down with it.
+var fx: FXPlayer = null
+
 # --- LEFT-GUTTER LAYOUT ---
-# Each player owns a vertical band. Within it, three clearly separated sections stack
-# top->bottom from the bank label: BANK, then POWER-UP SLOTS, then CAPTURED PIECES.
-# Captures grow downward and stay inside the band (max 15 captures = 4 rows). The two
-# bands don't overlap, so nothing interferes with clicking a captured piece to revive.
+# Each player owns a vertical band. Within it, four clearly separated sections stack
+# top->bottom from the bank label: BANK, SUBS meter, POWER-UP SLOTS, then the BENCH.
+# The bench grows downward and stays inside the band (max 15 pieces = 4 rows). The two
+# bands don't overlap, so nothing interferes with clicking a benched piece to tap it in.
 const GUTTER_X := 50.0
-const SLOTS_HEADING_DY := 38.0    # heading offset below the bank label
-const SLOTS_FIRST_DY := 60.0      # first slot button offset below the bank label
-const SLOT_STEP_Y := 32.0         # vertical pitch between slot buttons
-const CAPTURED_HEADING_DY := 162.0  # captured-tray heading offset below the bank label
-const CAPTURED_FIRST_DY := 184.0    # first captured-icon row offset below the bank label
+# Usable text width in the gutter: from GUTTER_X to the board's left edge, less a margin.
+# Gutter labels are clamped to this so long headings can never bleed across the board.
+const GUTTER_W := 238.0
+# These offsets are multiplied by UI_FONT_SCALE so the vertical rhythm tracks the font
+# dial. Without this, raising UI_FONT_SCALE grows the text but not the gaps, and the
+# bank label collides with the power-up heading below it.
+# Every offset below is measured from the bank label's Y and multiplied by UI_FONT_SCALE.
+# They are TUNED CONSTANTS, not derived ones: a Poxast label's box is much taller than its
+# glyphs (a 19px bank label reports 44px of height, ~14 of which is leading above the
+# letters), so anchoring off get_combined_minimum_size() puts a row in the gap and looks
+# broken. The numbers below are set against the rendered glyphs instead. If you change
+# UI_FONT_SCALE or the fonts, re-check the band visually — the whole stack has ~20px of
+# slack at four bench rows.
+const SUBS_DY := 40.0 * UI_FONT_SCALE             # SUBS meter, below the bank amount
+const SLOTS_HEADING_DY := 68.0 * UI_FONT_SCALE    # heading offset below the bank label
+const SLOTS_FIRST_DY := 94.0 * UI_FONT_SCALE      # first slot button offset below the bank label
+# Pitch must exceed the button's RENDERED height (~37px after the empty styleboxes in
+# _draw_slot_row), not the 30 we ask for — a Button clamps its size up to its minimum.
+const SLOT_STEP_Y := 46.0 * UI_FONT_SCALE         # vertical pitch between slot buttons
+const BENCH_HEADING_DY := 241.0 * UI_FONT_SCALE   # bench heading offset below the bank label
+const BENCH_FIRST_DY := 265.0 * UI_FONT_SCALE     # first bench-icon row offset below the bank label
+
+# Shop tooltip width. The panel itself is only 200px, which at the tooltip's font size
+# wraps to about six characters a line — so the box is deliberately WIDER than the panel
+# and hangs left over the board. It is a hover overlay; covering a few squares for as
+# long as the cursor rests on a shop button costs nothing.
+const TIP_W := 336.0
 
 # --- PIECE & BOARD DATA ---
 var piece_rules = {
-	"Pawn": {"value": 1, "revive_cost": 4},
-	"Knight": {"value": 3, "revive_cost": 6},
-	"Bishop": {"value": 3, "revive_cost": 6},
-	"Rook": {"value": 5, "revive_cost": 10},
-	"Queen": {"value": 9, "revive_cost": 18},
-	"King": {"value": 0, "revive_cost": 0} 
+	"Pawn": {"value": 1},
+	"Knight": {"value": 3},
+	"Bishop": {"value": 3},
+	"Rook": {"value": 5},
+	"Queen": {"value": 9},
+	"King": {"value": 0}
 }
+
+# --- TAP-IN PRICING ---
+# One formula replaces the old flat revive_cost table. You pay a flat fee for the
+# substitution itself, plus a steep premium on any VALUE you gain by it:
+#
+#     cost = SUB_FEE + max(0, value_in − value_out) * VALUE_COEF
+#
+#   Queen in for a Pawn   (9−1)*2 + 1 = $17   the upgrade — deliberately expensive
+#   Rook in for a Knight  (5−3)*2 + 1 = $5
+#   Knight for a Bishop   (3−3)*2 + 1 = $1    lateral rotation — nearly free
+#   Pawn in for a Queen   (1−9)→0  + 1 = $1   THE RESCUE — cheap on the way out
+#
+# The asymmetry IS the mechanic: pulling a doomed Queen off the board costs a dollar,
+# putting her back on costs seventeen. Both constants are tuning dials — SUB_FEE stops
+# lateral swaps being literally free, VALUE_COEF is the brake on upgrades.
+const SUB_FEE := 1
+const VALUE_COEF := 2
+
+# Gold price of tapping `type_in` on in place of `type_out`. Pure function of the two
+# piece values; safe to call from the bot's search as well as the UI.
+func tapin_cost(type_in: String, type_out: String) -> int:
+	var v_in: int = int(piece_rules[type_in]["value"])
+	var v_out: int = int(piece_rules[type_out]["value"])
+	return SUB_FEE + max(0, v_in - v_out) * VALUE_COEF
 
 var starting_positions = {
 	"Black": {
@@ -169,30 +284,62 @@ signal promotion_chosen(piece_type: String)
 func _maybe_let_bot_move():
 	if not vs_bot or game_over or current_turn != bot_color:
 		return
-	# Brief pause so your move renders first and the bot feels like it's thinking.
-	await get_tree().create_timer(1.6).timeout
+
+	# TIMING CONTRACT (bot_turn_seconds): the bot's turn-ending action fires exactly
+	# bot_turn_seconds after this point, no matter how many actions the plan holds or
+	# how long the search took. Everything below is scheduled against this one origin.
+	var turn_start_us := Time.get_ticks_usec()
+
+	# Let your move paint before the blocking search stalls the main thread — otherwise
+	# the freeze lands on the same frame your piece arrives and reads as a hitch.
+	await get_tree().process_frame
+	await get_tree().process_frame
 	if game_over or current_turn != bot_color:
 		return
 
-	# plan_turn() is a heavy blocking search; yield one frame after it so the first
-	# slide tween animates smoothly.
+	# plan_turn() is a heavy blocking search (up to the bot's MAX_THINK_MS). It runs up
+	# front so its cost is SPENT FROM the budget rather than added to it: a slow think
+	# just shortens the pause that follows, and the turn still lands on time.
 	var plan = bot.plan_turn(bot_color)
 	await get_tree().process_frame
+	if game_over or current_turn != bot_color:
+		return
+
+	# PACING. The turn-ending action always lands exactly on the deadline; the actions before
+	# it are spread evenly across whatever is LEFT once the search has finished, not across
+	# the whole turn. Anchoring to the deadline and working backwards is what makes this hold
+	# at every difficulty: a slow think eats the pause and compresses the gaps, but the beats
+	# stay visibly separated instead of two of them landing in the same frame.
+	#
+	#   Easy   (~1.15s planning) → beats at 2.10s / 3.05s / 4.00s
+	#   Über   (~3.30s planning) → beats at 3.53s / 3.77s / 4.00s   (still separated, ~233ms)
+	#
+	# One action is the common case and always reads the same: one pause, then the move at 4s.
+	var deadline_us := turn_start_us + int(bot_turn_seconds * 1000000.0)
+	var n: int = plan.size()
+	var window_us: int = maxi(deadline_us - Time.get_ticks_usec(), 0)
+	var slot_us := int(window_us / float(n if n > 0 else 1))
+	var i := 0
 	for act in plan:
+		if game_over or current_turn != bot_color:
+			break
+		i += 1
+		# Absolute deadline, not a sleep: time burned by the previous action's animation comes
+		# out of THIS gap, so overruns are absorbed instead of accumulating into a long turn.
+		# Counting DOWN from the deadline guarantees the last action is on time even if an
+		# earlier one ran long.
+		await _wait_until(deadline_us - slot_us * (n - i))
 		if game_over or current_turn != bot_color:
 			break
 		match act["kind"]:
 			"use":
 				_bot_use(act["item"], act["target"])
-				await get_tree().create_timer(1.5).timeout  # let you see each power-up land
 			"cheat":
 				await _bot_cheat(act["from"], act["to"])
-				await get_tree().create_timer(1.5).timeout
 			"buy":
 				_bot_buy(act["item"])
-				await get_tree().create_timer(1.5).timeout
-			"revive":
-				_bot_revive(act["index"], act["tile"])  # this ends the turn
+			"tapin":
+				_bot_tapin(act["index"], act["square"])  # this ends the turn
 			"move":
 				# MUST await: the turn-swap happens inside execute_move; exiting early
 				# would let the safety net fire a second move mid-animation.
@@ -202,7 +349,23 @@ func _maybe_let_bot_move():
 	# game can't hang on the bot. Runs ONCE, after the loop.
 	if not game_over and current_turn == bot_color:
 		print("⚠️ Bot plan produced no completed move — playing a fallback.")
+		# Hold the same budget line so a fallback turn is paced like every other turn
+		# (an empty plan would otherwise snap a move out instantly).
+		await _wait_until(turn_start_us + int(bot_turn_seconds * 1000000.0))
+		if game_over or current_turn != bot_color:
+			return
 		await _bot_fallback_move()
+
+# Sleeps until an ABSOLUTE wall-clock deadline (usec, same clock as Time.get_ticks_usec).
+# If the deadline has already passed — a long search, a slow animation — it yields a single
+# frame and returns, so the schedule degrades to "as fast as possible" instead of overshooting
+# further. Always awaits something, so callers can always `await` it.
+func _wait_until(deadline_us: int) -> void:
+	var remaining_us := deadline_us - Time.get_ticks_usec()
+	if remaining_us > 0:
+		await get_tree().create_timer(remaining_us / 1000000.0).timeout
+	else:
+		await get_tree().process_frame
 
 # Bot purchases route through the same shop handler the human uses.
 func _bot_buy(item_name: String) -> bool:
@@ -248,29 +411,38 @@ func _bot_cheat(from_pos: Vector2, to_pos: Vector2) -> bool:
 	show_bot_action_banner("Cheated — moved your " + piece["type"])
 	return true
 
-# Bot-side Revive: brings a fallen piece back from the bot's tray onto a free starting
-# square, mirroring _do_revive. This ENDS the turn (reviving is the bot's move).
-func _bot_revive(index: int, tile: Vector2) -> bool:
-	if index < 0 or index >= captured_pieces[bot_color].size():
+# Bot-side Tap-In: swaps a benched piece onto one of the bot's own squares, mirroring
+# _do_tapin. This ENDS the turn (the substitution IS the bot's move).
+func _bot_tapin(index: int, square: Vector2) -> bool:
+	if index < 0 or index >= bench[bot_color].size():
 		return false
-	if board_state.has(tile):
+	if subs_left[bot_color] <= 0:
 		return false
-	var cap = captured_pieces[bot_color][index]
-	var ptype = cap["type"]
-	var cost = piece_rules[ptype]["revive_cost"]
-	if player_gold[bot_color] < cost:
+	var cap = bench[bot_color][index]
+	var ptype: String = cap["type"]
+	if not (square in _tapin_targets(bot_color, ptype)):
 		return false
-	# Tentatively place, then verify it doesn't leave the bot's King in check.
-	board_state[tile] = {"type": ptype, "color": bot_color, "modifier": "", "modifier_duration": 0, "is_super_pawn": false, "has_moved": false, "is_revived": true}
+	var outgoing = board_state[square]
+	var out_type: String = outgoing["type"]
+	var cost: int = tapin_cost(ptype, out_type)
+	# Tentatively swap, then verify it doesn't leave the bot's King in check.
+	var saved = outgoing.duplicate()
+	board_state[square] = {"type": ptype, "color": bot_color, "modifier": "", "modifier_duration": 0, "is_super_pawn": cap.get("is_super_pawn", false), "has_moved": true}
 	if is_in_check(bot_color):
-		board_state.erase(tile)
+		board_state[square] = saved
 		return false
 	player_gold[bot_color] -= cost
-	captured_pieces[bot_color].remove_at(index)
-	print("🤖✨ Bot REVIVED its ", ptype, " at ", tile, " for $", cost, " — ends turn.")
+	subs_left[bot_color] -= 1
+	bench[bot_color].remove_at(index)
+	bench[bot_color].append({
+		"type": out_type,
+		"is_super_pawn": saved.get("is_super_pawn", false)
+	})
+	print("🤖🔄 Bot TAPPED IN its ", ptype, " for its ", out_type, " at ", square,
+		" for $", cost, " — ", subs_left[bot_color], " sub(s) left. Ends turn.")
 	en_passant_target = Vector2(-1, -1)
 	_finish_turn(bot_color)
-	show_bot_action_banner("Revived a " + ptype)
+	show_bot_action_banner("Tapped in a " + ptype)
 	return true
 
 # Last-resort: play the bot's single best raw move with no power-ups, guaranteeing the
@@ -289,27 +461,63 @@ func _bot_fallback_move():
 
 # Flashes a short banner announcing a bot power-up action, so its buffed/odd-looking
 # moves are readable instead of feeling like a glitch. Auto-fades after a couple seconds.
-func show_bot_action_banner(text: String):
+# One banner, two callers. EVERY refusal of a player action must come through here.
+# Printing "⛔ No affordable swap" to the console and returning silently is why Tap-In
+# read as broken: at $0 the game correctly refused every swap and the player saw
+# nothing happen at all. A rule the player cannot see is indistinguishable from a bug.
+func _show_banner(text: String, color: Color, hold: float) -> void:
 	var banner = get_node_or_null("BotActionBanner")
 	if banner == null:
 		banner = Label.new()
 		banner.name = "BotActionBanner"
-		banner.position = Vector2(550, 75)   # just under the TurnIndicator
-		banner.add_theme_font_size_override("font_size", 20)
+		# Spans the board and centres, rather than starting at a fixed x. A refusal is a
+		# whole sentence, and left-anchored at x=550 the longer ones ran off the right of
+		# the window and over the shop. Centring also keeps it under the TurnIndicator.
+		banner.position = Vector2(BOARD_OFFSET.x, 75)
+		banner.size = Vector2(8 * TILE_SIZE, 0)
+		banner.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		banner.clip_text = true
+		banner.add_theme_font_size_override("font_size", 22)
 		add_child(banner)
-	banner.text = "🤖 " + text
-	banner.modulate = Color(1, 0.7, 0.1, 1)   # orange, fully opaque
-	# Fade it out over ~2s using a tween; it'll be refreshed if another action fires.
+	banner.text = text
+	banner.modulate = Color(color.r, color.g, color.b, 1.0)
+	# Fade out; refreshed if another action fires first.
 	var t = create_tween()
-	t.tween_interval(1.2)
+	t.tween_interval(hold)
 	t.tween_property(banner, "modulate:a", 0.0, 0.8)
+
+func show_bot_action_banner(text: String):
+	_show_banner("🤖 " + text, Color(1, 0.7, 0.1), 1.2)
+
+# Why the game just refused something the player tried to do. Held a beat longer than
+# the bot banner because the player is reading it, not glancing at it.
+func show_refusal(text: String) -> void:
+	print("⛔ ", text)
+	# Never narrate the opponent's replayed actions or the bot's own turn to the player.
+	if net_applying_remote or (vs_bot and current_turn == bot_color):
+		return
+	_show_banner("⛔ " + text, Color(1, 0.45, 0.4), 2.0)
 
 func _ready():
 	print("--- Welcome to ÜberChess ---")
 
+	# Pixelate all UI text + paint the stone background BEFORE any labels/board are built,
+	# so every node created below inherits the look.
+	_load_ui_fonts()
+	_draw_game_background()
+
+	# The effects layer. Added early so it sits under everything built below in tree
+	# order; its own z_index (4) is what actually puts it above the board.
+	fx = FXPlayer.new()
+	fx.name = "FX"
+	fx.game = self
+	add_child(fx)
+
 	# Match config from the menu (GameConfig autoload); defaults above cover editor-direct launches.
 	var cfg = get_node_or_null("/root/GameConfig")
 	if cfg != null:
+		if cfg.has_method("bot_turn_seconds"):
+			bot_turn_seconds = float(cfg.bot_turn_seconds())
 		vs_bot = cfg.is_bot_match()
 		bot_color = cfg.bot_color
 		is_multiplayer = cfg.is_multiplayer()
@@ -326,26 +534,52 @@ func _ready():
 			print("👥 Local 2-player match.")
 
 	# Left gutter: two vertical bands (bank → slots → captured), Black on top by default.
-	black_gold_label.add_theme_font_size_override("font_size", 24)
+	# NOT clipped — clipping a bank label hides the gold amount, which is the one number
+	# in the gutter that must always be readable. The text is shortened instead (below).
+	black_gold_label.add_theme_font_size_override("font_size", 19)
 	add_child(black_gold_label)
-	white_gold_label.add_theme_font_size_override("font_size", 24)
+	white_gold_label.add_theme_font_size_override("font_size", 19)
 	add_child(white_gold_label)
 	_layout_gutter_bands()
 
 	var turn_indicator = Label.new()
 	turn_indicator.name = "TurnIndicator"
 	turn_indicator.position = Vector2(550, 40)
-	turn_indicator.add_theme_font_size_override("font_size", 28)
+	turn_indicator.add_theme_font_size_override("font_size", 32)
+	# The in-game "hero" text gets the extruded 3D arcade font for flair. Falls back to
+	# the body/default font if accent.ttf is absent.
+	if font_accent != null:
+		turn_indicator.add_theme_font_override("font", font_accent)
 	add_child(turn_indicator)
+
+	# Top-left button strip. An HBox, not two hand-placed buttons: their widths depend on
+	# UI_FONT_SCALE and on how wide the loaded pixel font renders, so a hardcoded x offset
+	# for the second button either overlaps the first or leaves a gap at any other scale.
+	var top_bar = HBoxContainer.new()
+	top_bar.name = "TopBar"
+	top_bar.position = Vector2(GUTTER_X, 30)
+	top_bar.add_theme_constant_override("separation", 14)
+	add_child(top_bar)
 
 	# Returns to the main menu; swapping scenes discards the match, so it doubles as a reset.
 	var menu_btn = Button.new()
 	menu_btn.name = "MainMenuButton"
 	menu_btn.text = "≡ Menu"
-	menu_btn.position = Vector2(GUTTER_X, 30)
-	menu_btn.add_theme_font_size_override("font_size", 18)
+	menu_btn.add_theme_font_size_override("font_size", 20)
 	menu_btn.pressed.connect(self._on_main_menu_pressed)
-	add_child(menu_btn)
+	top_bar.add_child(menu_btn)
+
+	# Concede the match. Sits beside the menu button, above the gutter — always reachable,
+	# nowhere near the board or the shop. Always asks first. No clip_text / minimum width:
+	# the button sizes to its own label so the text can never be cut to "Resi".
+	_resign_button = Button.new()
+	_resign_button.name = "ResignButton"
+	_resign_button.text = "⚑ Resign"
+	_resign_button.add_theme_font_size_override("font_size", 20)
+	_style_shop_button(_resign_button, Color(0.90, 0.42, 0.42))  # muted red — destructive
+	_resign_button.pressed.connect(self._on_resign_pressed)
+	top_bar.add_child(_resign_button)
+	_refresh_resign_button()
 
 	update_gold_display()
 	draw_shop_ui()
@@ -362,7 +596,7 @@ func _ready():
 		_net_connect()
 
 	if vs_bot:
-		bot = UberBot.new(self)
+		bot = UberbotStrategy.new(self)
 		_maybe_let_bot_move()
 
 # ==========================================
@@ -370,25 +604,24 @@ func _ready():
 # ==========================================
 
 func update_gold_display():
-	white_gold_label.text = "White Bank: $" + str(player_gold["White"])
-	black_gold_label.text = "Black Bank: $" + str(player_gold["Black"])
+	# "White: $12" not "White Bank: $12" — the word "Bank" is 5 characters the 250px
+	# gutter can't afford in Poxast, and it pushed the amount off the edge.
+	white_gold_label.text = "White: $" + str(player_gold["White"])
+	black_gold_label.text = "Black: $" + str(player_gold["Black"])
 	# Gold (or the active player) may have changed — repaint shop buyable/blocked colors.
 	# Guarded because update_gold_display() runs once before the shop is built in _ready().
 	if not shop_buttons.is_empty():
 		refresh_shop_affordability()
 
-# Logs a fallen piece into ITS OWNER'S tray for later revival. (The capturer's
-# gold reward is handled separately in execute_move.)
+# Benches a fallen piece under ITS OWNER's color, where a later tap-in can bring it
+# back. (The capturer's gold reward is handled separately in execute_move.)
+# No eligibility flag any more: every fallen piece is bench-eligible forever, and the
+# per-match sub budget is what stops the board refilling itself.
 func record_capture(victim: Dictionary):
 	var owner = victim.get("color", "")
-	if owner == "" or not captured_pieces.has(owner):
+	if owner == "" or not bench.has(owner):
 		return
-	# A piece that was itself a revival is used up — it never returns to the tray, so
-	# every piece can be revived at most once in the whole game.
-	if victim.get("is_revived", false):
-		print("⚰️ ", owner, " ", victim.get("type", "?"), " was a revived piece — gone for good.")
-		return
-	captured_pieces[owner].append({
+	bench[owner].append({
 		"type": victim.get("type", "Pawn"),
 		"is_super_pawn": victim.get("is_super_pawn", false)
 	})
@@ -397,8 +630,10 @@ func record_capture(victim: Dictionary):
 # local player's bank/slots/captured sit at the bottom. Each band is drawn relative to
 # its bank label's Y — redraw the slot/captured rows after calling this.
 func _layout_gutter_bands() -> void:
-	var top_y := 100.0
-	var bottom_y := 510.0
+	# Bands moved 4px up / 20px down when the SUBS row was added: Black's band is capped
+	# by White's bank label below it, and four bench rows plus the new row needed the space.
+	var top_y := 96.0
+	var bottom_y := 530.0
 	if board_flipped:
 		black_gold_label.position = Vector2(GUTTER_X, bottom_y)
 		white_gold_label.position = Vector2(GUTTER_X, top_y)
@@ -406,41 +641,51 @@ func _layout_gutter_bands() -> void:
 		black_gold_label.position = Vector2(GUTTER_X, top_y)
 		white_gold_label.position = Vector2(GUTTER_X, bottom_y)
 
-# Redraws both captured-piece trays. Icons are clickable (click your own fallen piece
-# to revive it) and live in the "captured_display" group so board redraws skip them.
+# Redraws both bench trays. Icons are clickable (click one of your own benched pieces
+# to start a tap-in) and live in the "captured_display" group so board redraws skip
+# them. The group name is legacy — it is the bench now.
 func update_captured_display():
 	for child in get_children():
 		if child.is_in_group("captured_display"):
 			child.queue_free()
-	_draw_captured_tray("Black", black_gold_label.position.y)
-	_draw_captured_tray("White", white_gold_label.position.y)
+	_draw_bench_tray("Black", black_gold_label.position.y)
+	_draw_bench_tray("White", white_gold_label.position.y)
 
-func _draw_captured_tray(owner: String, label_y: float):
-	var pieces: Array = captured_pieces[owner]
-	var icon_size := 46.0
-	var spacing_x := 50.0
-	var row_spacing := 50.0
-	var per_row := 4
+func _draw_bench_tray(owner: String, label_y: float):
+	var pieces: Array = bench[owner]
+	# 5 across at 47px rather than 4 at 54: the un-overlapped slot buttons above cost the
+	# band ~44px, and a full bench of 15 now fits in 3 rows instead of 4, which more than
+	# pays it back. 5 * 47 = 235, just inside GUTTER_W (238).
+	var icon_size := 44.0
+	var spacing_x := 47.0
+	var row_spacing := 47.0
+	var per_row := 5
 	var x_start := GUTTER_X
-	var tray_top := label_y + CAPTURED_FIRST_DY
+	var tray_top := label_y + BENCH_FIRST_DY
 
 	# Section heading (always shown, so the zone is labeled even when empty).
 	var head := Label.new()
 	head.add_to_group("captured_display")
-	head.text = owner + " captured (tap to revive):"
-	head.add_theme_font_size_override("font_size", 14)
-	head.position = Vector2(x_start, label_y + CAPTURED_HEADING_DY)
+	head.text = "Bench:"
+	head.add_theme_font_size_override("font_size", 16)
+	head.custom_minimum_size = Vector2(GUTTER_W, 0)
+	head.clip_text = true
+	head.position = Vector2(x_start, label_y + BENCH_HEADING_DY)
 	add_child(head)
 
 	if pieces.is_empty():
 		var none := Label.new()
 		none.add_to_group("captured_display")
 		none.text = "—"
-		none.add_theme_font_size_override("font_size", 14)
+		none.add_theme_font_size_override("font_size", 20)
 		none.position = Vector2(x_start, tray_top)
 		add_child(none)
 		return
 
+	# The bench glows as a whole while tap-in is armed. Deliberately NOT per-icon
+	# affordability: the price depends on who comes OFF, so the numbers live on the
+	# board target squares (see update_visuals), not on the bench icons.
+	var armed: bool = owner == current_turn and (tapin_selecting or not tapin_pending.is_empty())
 	var i := 0
 	for cap in pieces:
 		var col = i % per_row
@@ -454,9 +699,68 @@ func _draw_captured_tray(owner: String, label_y: float):
 		btn.custom_minimum_size = Vector2(icon_size, icon_size)
 		btn.size = Vector2(icon_size, icon_size)
 		btn.position = Vector2(x_start + col * spacing_x, tray_top + row * row_spacing)
-		btn.pressed.connect(self._on_captured_pressed.bind(owner, i))
+		btn.pressed.connect(self._on_bench_pressed.bind(owner, i))
+
+		# The piece currently armed wears the selection gold; the rest of an armed
+		# bench wears a dimmer cyan so it reads as "these are live, that one is picked".
+		var picked: bool = not tapin_pending.is_empty() \
+			and tapin_pending["owner"] == owner and tapin_pending["index"] == i
+		if armed:
+			var ring = ColorRect.new()
+			ring.add_to_group("captured_display")
+			ring.color = Color(1.0, 0.82, 0.0, 0.45) if picked else Color(0.2, 0.9, 0.9, 0.25)
+			ring.size = Vector2(icon_size + 6, icon_size + 6)
+			ring.position = Vector2(x_start + col * spacing_x - 3, tray_top + row * row_spacing - 3)
+			add_child(ring)
+			btn.modulate = Color(1.0, 0.95, 0.5) if picked else Color(0.8, 1.0, 1.0)
+
 		add_child(btn)
 		i += 1
+
+# The substitution budget, drawn as filled/hollow pips under a side's bank label:
+#
+#     SUBS  ■ ■ □
+#
+# Pips are ColorRects rather than ●/○ glyphs because Poxast has no reliable circle
+# glyph, and a square pip reads correctly in a pixel-art UI anyway. Laid out in an
+# HBoxContainer so nothing depends on how wide the font renders "SUBS" (see the
+# no-hardcoded-x-offsets rule at the top of this file).
+#
+# The VERTICAL offset is measured, not guessed. A fixed SUBS_DY was the first attempt and
+# it printed the pips straight through "Black: $10": the bank label's rendered height
+# depends on the font AND on UI_FONT_SCALE, so any constant that clears it at one setting
+# collides at another. get_combined_minimum_size() asks the label how tall it actually is.
+func _draw_subs_meter(owner: String, label_y: float) -> void:
+	var pip := int(12 * UI_FONT_SCALE)
+	var row := HBoxContainer.new()
+	row.add_to_group("slot_display")
+	row.position = Vector2(GUTTER_X, label_y + SUBS_DY)
+	row.add_theme_constant_override("separation", int(6 * UI_FONT_SCALE))
+
+	var lbl := Label.new()
+	lbl.text = "SUBS"
+	# NOT pre-multiplied by UI_FONT_SCALE: _scale_text_node applies that to every
+	# font_size override in the scene, so scaling here too would shrink it twice.
+	lbl.add_theme_font_size_override("font_size", 14)
+	# Pin the row to pip height and centre the word in it. Left to its own devices the
+	# label reports a ~33px box for a 12px glyph, and that leading is what pushed the
+	# whole band down into the power-up slots.
+	lbl.custom_minimum_size = Vector2(0, pip)
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	# Spent to zero, the word itself goes dim red — the resource is gone for the match.
+	lbl.modulate = Color(0.55, 0.4, 0.4) if subs_left[owner] <= 0 else Color(0.75, 0.75, 0.8)
+	row.add_child(lbl)
+
+	for i in range(SUBS_PER_MATCH):
+		var box := ColorRect.new()
+		box.custom_minimum_size = Vector2(pip, pip)
+		box.color = Color(1.0, 0.82, 0.0) if i < subs_left[owner] else Color(0.3, 0.3, 0.36)
+		# Pips sit centered on the row rather than at the top of the box.
+		var wrap := CenterContainer.new()
+		wrap.add_child(box)
+		row.add_child(wrap)
+
+	add_child(row)
 
 # Both players' 3 power-up slots are drawn in the SLOTS section of their band (between the
 # bank label above and the captured tray below), in the "slot_display" group so the board
@@ -466,20 +770,26 @@ func update_slot_display():
 	for child in get_children():
 		if child.is_in_group("slot_display"):
 			child.queue_free()
+	_draw_subs_meter("Black", black_gold_label.position.y)
+	_draw_subs_meter("White", white_gold_label.position.y)
 	_draw_slot_row("Black", black_gold_label.position.y)
 	_draw_slot_row("White", white_gold_label.position.y)
 
 func _draw_slot_row(owner: String, label_y: float):
 	var slots: Array = powerup_slots[owner]
 	var x_start := GUTTER_X
-	var btn_w := 185.0
-	var btn_h := 26.0
+	var btn_w := 195.0
+	var btn_h := 30.0
 
 	# Section heading, clearly below the bank label.
 	var head := Label.new()
 	head.add_to_group("slot_display")
-	head.text = owner + " power-ups:"
-	head.add_theme_font_size_override("font_size", 14)
+	# No "Black "/"White " prefix: the bank label directly above already names the side,
+	# and Poxast is wide enough that the prefix forced a wrap into the slot buttons.
+	head.text = "Power-ups:"
+	head.add_theme_font_size_override("font_size", 16)
+	head.custom_minimum_size = Vector2(GUTTER_W, 0)
+	head.clip_text = true
 	head.position = Vector2(x_start, label_y + SLOTS_HEADING_DY)
 	add_child(head)
 
@@ -489,13 +799,27 @@ func _draw_slot_row(owner: String, label_y: float):
 		btn.position = Vector2(x_start, label_y + SLOTS_FIRST_DY + i * SLOT_STEP_Y)
 		btn.custom_minimum_size = Vector2(btn_w, btn_h)
 		btn.size = Vector2(btn_w, btn_h)
-		btn.add_theme_font_size_override("font_size", 14)
+		btn.add_theme_font_size_override("font_size", 15)
+		# Button's minimum size normally includes its text width, so a long slot name
+		# ("Super Pawn (locked)") would silently stretch the button past the gutter.
+		# clip_text stops the text from driving the button's size.
+		btn.clip_text = true
 		btn.flat = true
+		# A Button's minimum height is its font line box PLUS the theme stylebox's
+		# vertical content margins, and `size` is clamped up to that minimum — so these
+		# rendered 45px tall on a 30.6px pitch and each slot covered 14px of the one
+		# above it. The bottom of a slot belonged to the slot below, and an empty
+		# (disabled) slot 3 swallowed clicks meant for slot 2. flat=true only stops the
+		# box being DRAWN; it does not remove its margins. Empty styleboxes do.
+		for state in ["normal", "hover", "pressed", "disabled", "focus"]:
+			btn.add_theme_stylebox_override(state, StyleBoxEmpty.new())
 
 		if i < slots.size():
 			var slot = slots[i]
 			var is_ready: bool = slot["ready"]
-			var tag := " ✓" if is_ready else " (locked)"
+			# "✕" rather than "(locked)": the word costs 8 characters the gutter can't spare,
+			# and clip_text was cutting names off mid-word ("Capture (loc").
+			var tag := " ✓" if is_ready else " ✕"
 			btn.text = slot["name"] + tag
 
 			var col := Color(0.6, 0.6, 0.6)  # locked
@@ -525,92 +849,272 @@ func _on_main_menu_pressed():
 		ws.close()
 	get_tree().change_scene_to_file("res://main_menu.tscn")
 
-# Clicking one of your fallen pieces starts a revive. We validate ownership, the Uber
-# class limit, gold, and that at least one of its default starting squares is free, then
-# enter placement mode (highlight the free starting squares; the player clicks one).
-func _on_captured_pressed(owner: String, index: int):
+
+# --- RESIGNATION -----------------------------------------------------------------
+# The button is live for the whole match and greys out once the game is decided (or,
+# online, until MATCH_START — there is nothing to concede in the lobby).
+func _refresh_resign_button() -> void:
+	if _resign_button == null:
+		return
+	# Explicitly typed: game_over is an untyped var, so `:=` can't infer bool from it.
+	var live: bool = not game_over
+	if is_multiplayer and not net_match_started:
+		live = false
+	_resign_button.disabled = not live
+	_style_shop_button(_resign_button, Color(0.90, 0.42, 0.42) if live else Color(0.45, 0.35, 0.35))
+
+# Step 1 of 2: ask. Nothing is committed here — the actual resignation happens in the
+# dialog's confirm callback, so a stray click on the button costs nothing.
+func _on_resign_pressed() -> void:
+	if game_over or _confirm_open or is_animating:
+		return
+	if is_multiplayer and not net_match_started:
+		return
+	# Whose resignation this is: online it's your side, vs the bot it's the human's side,
+	# and in local hot-seat it's whoever is currently on the move.
+	var who: String = _local_player_color()
+	var loser_word: String = "You" if (is_multiplayer or vs_bot) else who
+	var prompt: String = "Resign the game?\n" + loser_word + " will lose the match."
+	var on_yes: Callable = func(): _do_resign(who)
+	_show_confirm_dialog(prompt, "Yes, resign", on_yes)
+
+# Step 2 of 2: commit. Broadcasts first (send_to_server no-ops offline), then ends the
+# match locally, so both clients land on the same result.
+func _do_resign(color: String) -> void:
 	if game_over:
 		return
-	# Single-player: the revive tray is the human's — lock it during the bot's turn.
+	send_to_server({"type": "RESIGN", "color": color})
+	_apply_resignation(color)
+
+# Ends the match by resignation. Also the entry point for a RESIGN arriving over the
+# wire, which is why it does no broadcasting of its own.
+func _apply_resignation(color: String) -> void:
+	if game_over or color == "":
+		return
+	game_over = true
+	won_by_resignation = true
+	resigned_color = color
+	winner = "Black" if color == "White" else "White"
+	is_draw = false
+	in_check = false
+	# Drop anything in hand so the end-of-game board isn't left mid-interaction.
+	selected_square = Vector2(-1, -1)
+	held_powerup = ""
+	held_slot_index = -1
+	tapin_pending = {}
+	tapin_selecting = false
+	_fx_sync_check()   # the match is decided; nothing may keep pulsing
+	print("\n🏳️ MATCH OVER: ", color, " RESIGNED — ", winner, " wins.")
+	_refresh_resign_button()
+	update_visuals()
+	update_slot_display()
+	if is_multiplayer:
+		_show_rematch_ui()
+
+# --- GENERIC CONFIRM DIALOG ------------------------------------------------------
+# Modal yes/no over the board. _confirm_open gates _input for the whole time it is up:
+# Node2D._input runs BEFORE Control GUI handling in Godot 4, so the overlay alone would
+# not stop a click from also landing on the square behind it.
+func _show_confirm_dialog(message: String, confirm_text: String, on_confirm: Callable) -> void:
+	if _confirm_open:
+		return
+	_confirm_open = true
+
+	var ov = CanvasLayer.new()
+	ov.name = "ConfirmOverlay"
+	ov.layer = 120
+	add_child(ov)
+
+	var bg = ColorRect.new()
+	bg.color = Color(0, 0, 0, 0.62)
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	ov.add_child(bg)
+
+	var panel = PanelContainer.new()
+	panel.set_anchors_preset(Control.PRESET_CENTER)
+	panel.position = Vector2(-190, -95)
+	ov.add_child(panel)
+
+	var box = VBoxContainer.new()
+	box.add_theme_constant_override("separation", 14)
+	panel.add_child(box)
+
+	var lbl = Label.new()
+	lbl.text = message
+	lbl.add_theme_font_size_override("font_size", 22)
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl.custom_minimum_size = Vector2(340, 0)
+	box.add_child(lbl)
+
+	var yes = Button.new()
+	yes.text = confirm_text
+	yes.custom_minimum_size = Vector2(340, 44)
+	yes.add_theme_font_size_override("font_size", 20)
+	_style_shop_button(yes, Color(0.95, 0.45, 0.45))
+	yes.pressed.connect(func():
+		_close_confirm_dialog()
+		on_confirm.call())
+	box.add_child(yes)
+
+	# Cancel is the safe option, so it takes focus — Enter/Space dismisses rather than fires.
+	var no = Button.new()
+	no.text = "Cancel"
+	no.custom_minimum_size = Vector2(340, 40)
+	no.add_theme_font_size_override("font_size", 19)
+	no.pressed.connect(self._close_confirm_dialog)
+	box.add_child(no)
+	no.call_deferred("grab_focus")
+
+func _close_confirm_dialog() -> void:
+	var ov = get_node_or_null("ConfirmOverlay")
+	if ov:
+		ov.queue_free()
+	_confirm_open = false
+
+# --- TAP-IN ----------------------------------------------------------------------
+# The captured tray is a BENCH, not a graveyard. A benched piece comes on, the piece it
+# replaces comes off onto the same bench, and the turn ends. Three of these per match.
+
+# Is this square the far rank for `owner`'s pawns? A Pawn tapped straight onto its own
+# promotion rank would need the promotion picker to run inside a terminal action, which
+# is a soft-lock; blocking the square is much cheaper than special-casing it.
+func _is_promotion_rank(owner: String, square: Vector2) -> bool:
+	return (owner == "White" and square.y == 0) or (owner == "Black" and square.y == 7)
+
+# Every one of `owner`'s board pieces that `bench_type` may legally and affordably be
+# tapped in for. This is the ONLY place the eligibility rules live — the click handler,
+# the highlight pass and the commit all read it, so they cannot drift apart.
+func _tapin_targets(owner: String, bench_type: String) -> Array:
+	var out = []
+	if bench_type == "King":
+		return out                                   # can't happen; a lost King ends the match
+	for pos in board_state.keys():
+		var pc = board_state[pos]
+		if pc.get("color", "") != owner:
+			continue
+		if pc.get("type", "") == "King":
+			continue                                 # the King never leaves the field
+		if pc.get("modifier", "") == "Ground":
+			continue                                 # Grounded = bolted to the pitch this turn
+		if bench_type == "Pawn" and _is_promotion_rank(owner, pos):
+			continue                                 # see _is_promotion_rank
+		if player_gold[owner] < tapin_cost(bench_type, pc["type"]):
+			continue
+		out.append(pos)
+	return out
+
+# Is there ANY legal, affordable swap for this side right now? The shop color and the
+# arm step both ask this, so they can never disagree about whether Tap-In is live.
+func _has_playable_tapin(owner: String) -> bool:
+	if subs_left[owner] <= 0 or bench[owner].is_empty():
+		return false
+	for cap in bench[owner]:
+		if not _tapin_targets(owner, cap["type"]).is_empty():
+			return true
+	return false
+
+# Clicking one of your benched pieces arms a tap-in. We validate ownership, the Uber
+# class limit and the sub budget, then compute the legal swap targets and wait for the
+# player to click the piece that comes off.
+func _on_bench_pressed(owner: String, index: int):
+	if game_over:
+		return
+	# Single-player: the bench is the human's — lock it during the bot's turn.
 	if vs_bot and current_turn == bot_color:
 		return
-	# Online: only interact on your OWN turn. (Opponent revives are replayed via
-	# _do_revive directly, not through here, so this never blocks a remote action.)
+	# Online: only interact on your OWN turn. (Opponent tap-ins are replayed via
+	# _do_tapin directly, not through here, so this never blocks a remote action.)
 	if is_multiplayer and not net_applying_remote and current_turn != my_side:
 		return
-	# TOGGLE OFF: clicking the same fallen piece that's already pending cancels the revive,
-	# so the tray selects and deselects like the board pieces and power-up slots do.
-	# (Clicking a DIFFERENT fallen piece falls through below and re-targets to that one.)
-	if not revive_pending.is_empty() \
-	and revive_pending["owner"] == owner \
-	and revive_pending["index"] == index:
-		print("✨ Revive deselected.")
-		revive_pending = {}
+	# TOGGLE OFF: clicking the armed piece again disarms, so the bench selects and
+	# deselects like the board pieces and power-up slots do. (Clicking a DIFFERENT
+	# benched piece falls through below and re-arms onto that one.)
+	if not tapin_pending.is_empty() \
+	and tapin_pending["owner"] == owner \
+	and tapin_pending["index"] == index:
+		print("🔄 Tap-in deselected.")
+		tapin_pending = {}
 		update_visuals()
+		update_captured_display()
 		return
 	if owner != current_turn:
-		print("⛔ You can only revive your own pieces, on your own turn.")
+		show_refusal("You can only tap in your own pieces, on your own turn.")
 		return
 	if "Uber" in used_classes_this_turn:
-		print("⛔ You've already used an Uber power this turn.")
+		show_refusal("You've already used an Uber power this turn.")
 		return
-	if index < 0 or index >= captured_pieces[owner].size():
+	if subs_left[owner] <= 0:
+		show_refusal("No substitutions left this match.")
 		return
-	var cap = captured_pieces[owner][index]
+	if index < 0 or index >= bench[owner].size():
+		return
+	var cap = bench[owner][index]
 	var ptype = cap["type"]
-	var cost = piece_rules[ptype]["revive_cost"]
-	if player_gold[owner] < cost:
-		print("⛔ Not enough gold to revive a ", ptype, " ($", cost, ").")
+	var targets = _tapin_targets(owner, ptype)
+	if targets.is_empty():
+		# Name the reason. "Nothing highlighted" is not a diagnosis, and the commonest
+		# cause by far is simply being too poor: every swap costs at least SUB_FEE.
+		if player_gold[owner] < SUB_FEE:
+			show_refusal("Tap-in costs at least $%d — you have $%d." % [SUB_FEE, player_gold[owner]])
+		else:
+			show_refusal("No %s you can afford to swap in right now." % ptype)
 		return
-	# Which of this piece's default starting squares are currently empty?
-	var candidates = []
-	for tile in starting_positions[owner][ptype]:
-		if not board_state.has(tile):
-			candidates.append(tile)
-	if candidates.is_empty():
-		print("⛔ Cannot revive ", ptype, ": all of its starting squares are occupied.")
-		return
-	# Enter placement mode — highlight the free starting squares and wait for a click.
+	# Arm it — highlight the swap targets and wait for a click.
 	# (Drop any held power-up / board selection so the modes don't collide.)
+	tapin_selecting = false
 	held_powerup = ""
 	selected_square = Vector2(-1, -1)
 	clear_shop_highlights()
-	revive_pending = {"owner": owner, "index": index, "type": ptype, "cost": cost, "candidates": candidates}
-	print("✨ Reviving a ", ptype, " — click a highlighted square (click the piece again, or right-click, to cancel).")
+	tapin_pending = {"owner": owner, "index": index, "type": ptype, "targets": targets}
+	print("🔄 Tapping in a ", ptype, " — click one of your highlighted pieces (click the bench piece again, or right-click, to cancel).")
 	update_visuals()
+	update_captured_display()
 
-# Spawns the revived piece, deducts the cost, and ENDS the turn (reviving is your move).
-# A revived piece is flagged is_revived so it can never be revived a second time. The
-# placement is rejected if it would leave your own King in check.
-func _do_revive(owner: String, index: int, tile: Vector2):
-	if index < 0 or index >= captured_pieces[owner].size():
-		revive_pending = {}
+# Performs the swap, charges gold, spends a sub, and ENDS the turn.
+# The incoming piece arrives PLAIN — no modifier, has_moved TRUE (so tapping onto a
+# Rook's home square can never hand castling rights back) — but keeps Super Pawn status,
+# which is a permanent property of the piece rather than a per-turn buff. The outgoing
+# piece SHEDS its modifier on the way to the bench: buffs do not ride the bench.
+# Rejected if the swap would leave the owner's own King in check.
+func _do_tapin(owner: String, index: int, square: Vector2):
+	if index < 0 or index >= bench[owner].size():
+		tapin_pending = {}
 		return
-	if board_state.has(tile):
-		print("⛔ That starting square is no longer free.")
+	if subs_left[owner] <= 0:
+		tapin_pending = {}
 		return
-	var cap = captured_pieces[owner][index]
+	var cap = bench[owner][index]
 	var ptype = cap["type"]
-	var cost = piece_rules[ptype]["revive_cost"]
-	if player_gold[owner] < cost:
-		revive_pending = {}
+	# Re-validate the target from scratch rather than trusting the cached list — this is
+	# also the entry point for a TAP_IN arriving over the wire and for the bot.
+	if not (square in _tapin_targets(owner, ptype)):
+		print("⛔ That piece can't be swapped out.")
 		return
-	# Tentatively place to verify it doesn't leave our own King in check. A revived piece
-	# returns as a plain piece (no buffs / Super Pawn) with has_moved=false, flagged
-	# is_revived so a later capture removes it for good.
-	board_state[tile] = {"type": ptype, "color": owner, "modifier": "", "modifier_duration": 0, "is_super_pawn": false, "has_moved": false, "is_revived": true}
+	var outgoing = board_state[square]
+	var out_type: String = outgoing["type"]
+	var cost: int = tapin_cost(ptype, out_type)
+	# Tentative swap, so an illegal result never reaches the network or the bank.
+	var saved = outgoing.duplicate()
+	board_state[square] = {"type": ptype, "color": owner, "modifier": "", "modifier_duration": 0, "is_super_pawn": cap.get("is_super_pawn", false), "has_moved": true}
 	if is_in_check(owner):
-		board_state.erase(tile)
-		print("⛔ Reviving there would leave your King in check — pick another square.")
-		return  # keep revive_pending so the player can choose a different square
-	# --- NETWORK: broadcast the revive (tray index + target square) before it commits.
-	# We only reach here once the placement is validated, so it never desyncs.
-	send_to_server({"type": "REVIVE", "index": index, "tile": _v2arr(tile)})
-	# Commit: charge gold, remove from the tray, and spend the turn.
+		board_state[square] = saved
+		print("⛔ That swap would leave your King in check — pick another piece.")
+		return  # keep tapin_pending so the player can choose a different target
+	# --- NETWORK: broadcast (bench index + target square) once the swap is validated,
+	# so it never desyncs. The opponent replays it through this same function.
+	send_to_server({"type": "TAP_IN", "bench_index": index, "square": _v2arr(square)})
+	# Commit: charge gold, spend a sub, and rotate the two pieces through the bench.
 	player_gold[owner] -= cost
-	captured_pieces[owner].remove_at(index)
-	print("✨ REVIVED: ", owner, " ", ptype, " at ", tile, " for $", cost, " — this uses your turn.")
-	en_passant_target = Vector2(-1, -1)  # reviving leaves no en passant trail
+	subs_left[owner] -= 1
+	bench[owner].remove_at(index)
+	bench[owner].append({
+		"type": out_type,
+		"is_super_pawn": saved.get("is_super_pawn", false)
+	})
+	print("🔄 TAP-IN: ", owner, " ", ptype, " on for ", out_type, " at ", square,
+		" for $", cost, " — ", subs_left[owner], " sub(s) left. This uses your turn.")
+	en_passant_target = Vector2(-1, -1)  # a substitution leaves no en passant trail
 	_finish_turn(owner)
 
 # --- SYSTEM: BOARD INITIALIZATION ---
@@ -620,7 +1124,7 @@ func initialize_board():
 		for piece_type in starting_positions[color].keys():
 			for pos in starting_positions[color][piece_type]:
 				# Add "has_moved" to the DNA of every piece
-				board_state[pos] = {"type": piece_type, "color": color, "modifier": "", "modifier_duration": 0, "is_super_pawn": false, "has_moved": false, "is_revived": false}
+				board_state[pos] = {"type": piece_type, "color": color, "modifier": "", "modifier_duration": 0, "is_super_pawn": false, "has_moved": false}
 	print("Board initialized. Tracking ", board_state.size(), " pieces.")
 
 # --- SYSTEM: RULE ENFORCEMENT & TURN LOGIC ---
@@ -635,44 +1139,59 @@ func _style_shop_button(btn: Button, color: Color) -> void:
 # "Clearing" the shop selection means dropping the gold held-item highlight and
 # repainting every button by its true affordability state (not flat white).
 func clear_shop_highlights() -> void:
+	tapin_selecting = false
 	refresh_shop_affordability()
 
 # Lights one shop button up in the selection gold (the item currently in hand).
 func highlight_shop_button(item_name: String) -> void:
 	_style_shop_button(shop_buttons[item_name], Color(1, 0.8, 0))
 
-# Repaints shop FONT colors for the active player: green = buyable, dim red = not,
-# gold = held selection, cyan = Revive (dynamic cost). Called on every gold/slot
-# change. Hover background is a separate system and is not disturbed here.
+# The color the LOCAL human controls. In bot matches it's the non-bot side; online it's
+# my_side; in local hot-seat both players are local, so the shop follows whoever's up.
+func _local_player_color() -> String:
+	if is_multiplayer:
+		return my_side
+	if vs_bot:
+		return "White" if bot_color == "Black" else "Black"
+	return current_turn
+
+# Repaints shop FONT colors for the LOCAL player: green = buyable, dim red = not,
+# gold = held selection, cyan = Tap-In (dynamic cost). Called on every gold/slot
+# change. Buttons stay ENABLED at all times so hovering/tooltips keep working even on
+# the opponent's turn — purchasing is gated separately in _on_shop_item_pressed.
+# Colors always reflect the LOCAL player's wallet, so they never flicker to the
+# opponent's affordability while the bot/opponent is on the move.
 func refresh_shop_affordability() -> void:
-	var gold: int = player_gold[current_turn]
-	var slots_full: bool = powerup_slots[current_turn].size() >= MAX_SLOTS
-	# Online: the shop belongs to whoever's turn it is, so on the opponent's turn the
-	# local player's shop is locked (greyed out and unclickable). Always open otherwise.
-	var shop_open: bool = (not is_multiplayer) or (current_turn == my_side)
+	var me: String = _local_player_color()
+	var gold: int = player_gold[me]
+	var slots_full: bool = powerup_slots[me].size() >= MAX_SLOTS
 
 	var buyable_col   := Color(0.45, 0.95, 0.5)   # green
 	var blocked_col   := Color(0.55, 0.4, 0.4)    # dim red-gray
-	var revive_col    := Color(0.55, 0.85, 1.0)   # cyan (special: tray-driven)
+	var tapin_col     := Color(0.55, 0.85, 1.0)   # cyan (special: bench-driven)
+	var spent_col     := Color(0.45, 0.33, 0.33)  # subs exhausted — dead for the match
 	var held_col      := Color(1, 0.8, 0)         # selection gold
-	var locked_col    := Color(0.4, 0.4, 0.45)    # opponent's turn — shop unavailable
 
 	for item_name in shop_buttons.keys():
 		var btn: Button = shop_buttons[item_name]
-		btn.disabled = not shop_open
-		if not shop_open:
-			_style_shop_button(btn, locked_col)
-			continue
+		btn.disabled = false   # always interactable; purchase is gated on press
 
 		# The held item always shows gold, regardless of affordability.
 		if held_powerup == item_name and held_powerup != "":
 			_style_shop_button(btn, held_col)
 			continue
 
-		# Revive is bought by clicking a fallen piece in the tray, not from a slot,
-		# and its cost varies by piece — show it in its own informative color.
-		if item_name == "Revive":
-			_style_shop_button(btn, revive_col)
+		# Tap-In is driven from the bench, not from a slot, and its cost varies with
+		# BOTH pieces in the swap — but it still owes the player a buyable/blocked
+		# verdict like every other item. Showing it permanently cyan while every swap
+		# was unaffordable is what made a correct refusal look like a broken button.
+		if item_name == "Tap-In":
+			if subs_left[me] <= 0:
+				_style_shop_button(btn, spent_col)      # gone for the match
+			elif _has_playable_tapin(me):
+				_style_shop_button(btn, tapin_col)      # live
+			else:
+				_style_shop_button(btn, blocked_col)    # broke, benchless, or nothing legal
 			continue
 
 		var cost: int = btn.get_meta("cost", 0)
@@ -694,9 +1213,39 @@ func _on_shop_item_pressed(item_name, cost):
 		print("⛔ Not your turn — the shop is locked.")
 		return
 
-	# Revive isn't slotted — it's triggered live by clicking a fallen piece in your tray.
-	if item_name == "Revive":
-		print("✨ To revive, click one of your fallen pieces shown above your bank.")
+	# Tap-In isn't slotted — clicking it in the shop just lights the bench up. The real
+	# flow is bench piece → board piece; this button is the affordance that says so.
+	if item_name == "Tap-In":
+		if vs_bot and current_turn == bot_color and not bot_buying:
+			return
+		if is_multiplayer and not net_applying_remote and current_turn != my_side:
+			return
+		# Toggle off if already armed (either stage of the flow).
+		if tapin_selecting or not tapin_pending.is_empty():
+			tapin_selecting = false
+			tapin_pending = {}
+			update_visuals()
+			update_captured_display()
+			return
+		if subs_left[current_turn] <= 0:
+			show_refusal("No substitutions left this match.")
+			return
+		if bench[current_turn].is_empty():
+			show_refusal("Your bench is empty — nothing to tap in.")
+			return
+		# Only arm if SOME bench piece has a legal, affordable piece to come on for.
+		if not _has_playable_tapin(current_turn):
+			if player_gold[current_turn] < SUB_FEE:
+				show_refusal("Tap-in costs at least $%d — you have $%d." % [SUB_FEE, player_gold[current_turn]])
+			else:
+				show_refusal("No swap you can afford right now.")
+			return
+		tapin_selecting = true
+		held_powerup = ""
+		selected_square = Vector2(-1, -1)
+		highlight_shop_button("Tap-In")
+		update_visuals()
+		update_captured_display()
 		return
 
 	# Buying pays gold NOW and drops the power-up into a slot as not-yet-usable. The
@@ -904,6 +1453,25 @@ func is_valid_destination(pos: Vector2, my_color: String) -> bool:
 			
 	return true
 
+# Where is this side's King? Returns null if it is not on the board at all (it has
+# been captured, and the match is already over). fx.gd needs this every frame while
+# the check marker is up, so it stays a plain lookup with no side effects.
+func _find_king(color: String):
+	for pos in board_state:
+		var pc = board_state[pos]
+		if pc.get("type", "") == "King" and pc.get("color", "") == color:
+			return pos
+	return null
+
+# The live visual node for the piece on `pos`, or null. Pieces are rebuilt by
+# update_visuals() on every redraw, so NEVER hold on to what this returns — ask
+# again, or bind your tween to the node so it dies with it.
+func _piece_node_at(pos: Vector2):
+	for n in get_tree().get_nodes_in_group("board_piece"):
+		if n.get_meta("board_pos", Vector2(-99, -99)) == pos:
+			return n
+	return null
+
 func is_in_check(color: String) -> bool:
 	var king_pos = Vector2(-1, -1)
 	
@@ -982,7 +1550,7 @@ func get_legal_moves(pos: Vector2, checking_threats: bool = false) -> Array:
 		
 	var color = piece["color"]
 	
-	# --- MOVEMENT POWER-UPS ---
+	# --- AGILITY POWER-UPS ---
 	# These only reshape moves for the piece's own real move, never for threat scans
 	# (checking_threats), so check/checkmate detection always uses normal geometry.
 	var modifier = piece.get("modifier", "")
@@ -1026,6 +1594,14 @@ func get_legal_moves(pos: Vector2, checking_threats: bool = false) -> Array:
 						moves.append(sq)  # push onto an empty square
 					elif board_state[sq]["color"] != color and not is_invulnerable(sq):
 						moves.append(sq)  # capture a vulnerable enemy
+
+				# First-move double push (forward only) — a pawn upgraded to Super
+				# Pawn before it has moved keeps the regular pawn's opening option.
+				if not piece.get("has_moved", false):
+					var one = pos + Vector2(0, dir)
+					var two = pos + Vector2(0, dir * 2)
+					if is_within_bounds(two) and not board_state.has(one) and not board_state.has(two):
+						moves.append(two)
 
 				# Forward diagonals — capture only (no free move onto empty squares).
 				for d in [Vector2(-1, dir), Vector2(1, dir)]:
@@ -1161,10 +1737,15 @@ func get_safe_moves(pos: Vector2) -> Array:
 	
 	for target_pos in raw_moves:
 		
-		# 0. KINGS ARE NEVER CAPTURABLE. A real move may never land on an enemy King —
-		# the game ends at checkmate first. (Threat scans run through get_legal_moves
-		# directly, NOT here, so enemy King squares still register for check detection.)
-		if board_state.has(target_pos) and board_state[target_pos]["type"] == "King":
+		# 0. CAPTURING THE ENEMY KING WINS THE GAME. A real move landing on the enemy King
+		# is always legal and always winning — it is NOT filtered by the self-check
+		# simulation below, because whoever takes a King first wins outright (even while
+		# your own King sits in check). Short-circuit it straight into the safe list.
+		# (Threat scans run through get_legal_moves directly, NOT here, so King squares
+		# still register for check detection exactly as before.)
+		if board_state.has(target_pos) and board_state[target_pos]["type"] == "King" \
+		and board_state[target_pos]["color"] != my_color:
+			safe_moves.append(target_pos)
 			continue
 		
 		# 1. REMEMBER THE PRESENT
@@ -1247,11 +1828,19 @@ func _make_ghost(image_path: String, pixel: Vector2, ghost_name: String = "AnimG
 # CALLER owns the board_state mutation and the final update_visuals(). Used by
 # execute_move, the castling rook, and Cheat puppeting, so every piece on the board
 # moves the SAME smooth way.
-func _slide_piece(image_path: String, from_pos: Vector2, to_pos: Vector2, duration: float = 0.22) -> void:
+# `piece_type` is optional only so older call sites keep working; pass it. It is what
+# lets a piece travel in its OWN way instead of every piece gliding identically —
+# currently just the Knight, which vaults (fx.gd / GDD 6.8). Routing that through here
+# rather than through execute_move means a Cheat-puppeted knight leaps too, which is
+# correct: it is how knights move, not a property of whose turn it is.
+func _slide_piece(image_path: String, from_pos: Vector2, to_pos: Vector2, duration: float = 0.22, piece_type: String = "") -> void:
 	var ghost = _make_ghost(image_path, _square_center(from_pos), "AnimGhostSlide")
-	var tw = create_tween()
-	tw.tween_property(ghost, "position", _square_center(to_pos), duration).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-	await tw.finished
+	if piece_type == "Knight" and fx != null and fx.mode != FXPlayer.Mode.OFF:
+		await fx.play_awaited("knight_leap", to_pos, {"from": from_pos, "node": ghost})
+	else:
+		var tw = create_tween()
+		tw.tween_property(ghost, "position", _square_center(to_pos), duration).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		await tw.finished
 	if is_instance_valid(ghost):
 		ghost.queue_free()
 
@@ -1286,6 +1875,11 @@ func execute_move(from_pos: Vector2, to_pos: Vector2):
 		var v_name = "SuperPawn" if victim_data.get("is_super_pawn", false) else victim_data["type"]
 		var victim_ghost = _make_ghost("res://assets/pieces/" + victim_data["color"] + "_" + v_name + ".png", _square_center(to_pos), "AnimGhostVictim", 19)
 		var vt = create_tween()
+		# Hold the victim on the board until the mover actually ARRIVES. Without this a
+		# leaping knight's target fades out while the knight is still mid-air, and the
+		# landing lands on an empty square — the one frame the whole animation is for.
+		if piece["type"] == "Knight" and fx != null:
+			vt.tween_interval(fx.travel_time("knight_leap"))
 		vt.tween_property(victim_ghost, "modulate:a", 0.0, 0.15)
 		vt.tween_callback(func():
 			if is_instance_valid(victim_ghost):
@@ -1304,7 +1898,7 @@ func execute_move(from_pos: Vector2, to_pos: Vector2):
 			var rook_tween = create_tween()
 			rook_tween.tween_property(rook_ghost, "position", _square_center(rook_to_pre), 0.22).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
 
-	await _slide_piece(image_path, from_pos, to_pos)
+	await _slide_piece(image_path, from_pos, to_pos, 0.22, piece["type"])
 	if is_instance_valid(rook_ghost):
 		rook_ghost.queue_free()
 	is_animating = false
@@ -1341,6 +1935,30 @@ func execute_move(from_pos: Vector2, to_pos: Vector2):
 	# --- 4. STANDARD CAPTURE & ECONOMY ---
 	if board_state.has(to_pos):
 		var captured_piece = board_state[to_pos]
+
+		# KING CAPTURE = INSTANT WIN. Taking a King ends the game on the spot: no gold
+		# payout, no captured-tray entry, no promotion check, no turn swap. The capturing
+		# piece has already slid on and the King has faded; we just commit the capturer
+		# onto the square, flag the win, refresh the UI, and bail out of the rest of the
+		# move. (has_moved was set in step 3 above. The ceremonial finisher animation
+		# lands in the next slice and hooks in right here.)
+		if captured_piece["type"] == "King":
+			board_state.erase(from_pos)
+			board_state[to_pos] = piece
+			game_over = true
+			won_by_king_capture = true
+			winner = moving_color
+			print("\n👑💀 KING CAPTURED! ", moving_color, " wins by taking the ", captured_piece["color"], " King.")
+			in_check = false
+			_fx_sync_check()   # _finish_turn early-returns on game_over and never runs
+			update_visuals()
+			update_gold_display()
+			update_captured_display()
+			update_slot_display()
+			if is_multiplayer:
+				_show_rematch_ui()
+			return
+
 		var capture_value = _capture_payout(piece, captured_piece)
 		player_gold[moving_color] += capture_value
 		record_capture(captured_piece)
@@ -1427,7 +2045,7 @@ func _show_promotion_menu(color: String):
 
 	var title = Label.new()
 	title.text = "Promote your Pawn"
-	title.add_theme_font_size_override("font_size", 24)
+	title.add_theme_font_size_override("font_size", 28)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	vbox.add_child(title)
 
@@ -1458,15 +2076,41 @@ func _show_promotion_menu(color: String):
 
 		var lbl = Label.new()
 		lbl.text = piece_type
-		lbl.add_theme_font_size_override("font_size", 16)
+		lbl.add_theme_font_size_override("font_size", 19)
 		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		col.add_child(lbl)
 
-# Shared end-of-turn routine for BOTH a normal move and a revive. Evaluates whether the
+# Every fx call in game.gd goes through these two, so the null-guard lives in exactly
+# one place and a missing fx.gd can never crash a match.
+func _fx_play(effect: String, square, opts := {}) -> void:
+	if fx != null:
+		fx.play(effect, square, opts)
+
+# Brings the persistent check marker in line with the board. Called at every turn
+# swap and at every terminal result, so the marker can never outlive the condition —
+# a red ring still pulsing after the game ends reads as a bug, not a state.
+func _fx_sync_check() -> void:
+	if fx == null:
+		return
+	if game_over or not in_check:
+		fx.clear_check()
+	else:
+		fx.hold_check(current_turn)
+
+# Shared end-of-turn routine for BOTH a normal move and a tap-in. Evaluates whether the
 # opponent is now checkmated / stalemated / in check (awarding the $2 check bonus),
 # consumes the acting side's one-shot buffs, swaps the turn, and refreshes the UI.
 func _finish_turn(acting_color: String):
+	# The match may already be decided — a King capture, or a resignation that landed
+	# while this turn's animation was still running. Don't swap the turn or overwrite
+	# the result that's already on the board.
+	if game_over:
+		return
 	var enemy_color = "Black" if acting_color == "White" else "White"
+	# Set when check is newly delivered this turn, so the cast beat fires ONCE, after
+	# the redraw below. Firing it before update_visuals() would animate a piece node
+	# that the redraw is about to free.
+	var check_delivered := false
 
 	# Checkmate / stalemate / check for the side about to move.
 	var enemy_in_check = is_in_check(enemy_color)
@@ -1482,6 +2126,7 @@ func _finish_turn(acting_color: String):
 			print("\n🤝 MATCH OVER: STALEMATE — it's a draw.")
 	elif enemy_in_check:
 		in_check = true
+		check_delivered = true
 		player_gold[acting_color] += 2
 		print("⚠️ CHECK: The ", enemy_color, " King is threatened! +$2 awarded to ", acting_color, ".")
 
@@ -1490,7 +2135,7 @@ func _finish_turn(acting_color: String):
 	for p in board_state.keys():
 		var pc = board_state[p]
 		var m = pc.get("modifier", "")
-		if pc.get("color", "") == acting_color and (powerup_classes.get(m, "") == "Movement" or m == "Capture"):
+		if pc.get("color", "") == acting_color and (powerup_classes.get(m, "") == "Agility" or m == "Capture"):
 			print("✨ ", m, " spent by ", acting_color, " ", pc.get("type", "?"))
 			pc["modifier"] = ""
 			pc["modifier_duration"] = 0
@@ -1500,7 +2145,8 @@ func _finish_turn(acting_color: String):
 	print("⏳ Turn passed to: ", current_turn)
 	used_classes_this_turn.clear()
 	cheat_protected_square = Vector2(-1, -1)
-	revive_pending = {}
+	tapin_pending = {}
+	tapin_selecting = false
 	held_powerup = ""          # drop anything in hand across the swap
 	held_slot_index = -1
 	expire_modifiers(current_turn)
@@ -1508,6 +2154,10 @@ func _finish_turn(acting_color: String):
 	selected_square = Vector2(-1, -1)
 
 	update_visuals()
+	# FX after the redraw: the pieces the cast animates must be the ones now on screen.
+	if check_delivered:
+		_fx_play("check", _find_king(current_turn))
+	_fx_sync_check()
 	print("💰 ECONOMY: White $", player_gold["White"], " | Black $", player_gold["Black"])
 	update_gold_display()
 	update_captured_display()
@@ -1533,16 +2183,98 @@ func ready_slots(owner: String):
 # ==========================================
 
 
+# Loads a pixel .ttf and switches off antialiasing/hinting/subpixel so the glyphs
+# stay crisp and blocky instead of smoothed. Returns null if the file isn't there,
+# and logs the outcome so the Output panel shows exactly which fonts resolved.
+func _load_pixel_font(path: String, label: String) -> Font:
+	if not ResourceLoader.exists(path):
+		print("⚠️ Font NOT FOUND (", label, "): ", path)
+		return null
+	var f = load(path)
+	if f is FontFile:
+		f.antialiasing = TextServer.FONT_ANTIALIASING_NONE
+		f.hinting = TextServer.HINTING_NONE
+		f.subpixel_positioning = TextServer.SUBPIXEL_POSITIONING_DISABLED
+		f.force_autohinter = false
+	print("✓ Loaded ", label, " font: ", path)
+	return f
+
+# Loads the pixel-font set and applies the body font to every text node via direct
+# per-node overrides. We DON'T rely on ThemeDB.fallback_font alone — on a Node2D scene
+# it doesn't reliably reach child Controls (the turn banner's per-node override works,
+# the global fallback didn't). Connecting to node_added means any text node created
+# later (shop redraws, captured tray, slots, promotion picker, lobby) is caught too.
+# The heading font is chained as a glyph fallback so characters Merchant Copy lacks
+# (e.g. "Ü") are pulled from CoralPixels instead of rendering as an empty box.
+func _load_ui_fonts() -> void:
+	var ui = _load_pixel_font(FONT_UI_PATH, "ui")
+	var fb = _load_pixel_font(FONT_FALLBACK_PATH, "fallback")
+	font_accent = _load_pixel_font(FONT_ACCENT_PATH, "accent")
+	font_body = ui if ui != null else fb          # Poxast if present, else Merchant Copy
+	font_prose = fb if fb != null else ui         # Merchant Copy for sentences; see font_prose
+	if font_body == null:
+		push_warning("No UI font loaded — check FONT_UI_PATH / FONT_FALLBACK_PATH.")
+		return
+	if font_body is FontFile and fb != null and fb != font_body:
+		var chain: Array[Font] = [fb]             # per-glyph fallback for anything Poxast lacks
+		font_body.fallbacks = chain
+	ThemeDB.fallback_font = font_body
+	get_tree().node_added.connect(_apply_body_font_to)
+	_apply_body_font_recursive(self)
+
+# Applies the body font to a single node IF it's a text node that hasn't already had a
+# font chosen for it (so the turn banner keeps its accent font, titles keep theirs).
+func _apply_body_font_to(node: Node) -> void:
+	if node is Label or node is Button or node is LineEdit:
+		if font_body != null and not node.has_theme_font_override("font"):
+			node.add_theme_font_override("font", font_body)
+		_scale_text_node.call_deferred(node)   # deferred: runs after the node's own size is set
+
+func _scale_text_node(node: Node) -> void:
+	if not is_instance_valid(node) or node.get_meta("uber_scaled", false):
+		return
+	if node.has_theme_font_size_override("font_size"):
+		var base = node.get_theme_font_size("font_size")
+		node.add_theme_font_size_override("font_size", int(round(base * UI_FONT_SCALE)))
+		node.set_meta("uber_scaled", true)
+
+# One-time walk over whatever UI already exists when the fonts finish loading.
+func _apply_body_font_recursive(node: Node) -> void:
+	_apply_body_font_to(node)
+	for c in node.get_children():
+		_apply_body_font_recursive(c)
+
+# Full-window stone backdrop in the shop's color family. Sits behind the board,
+# shop, and every overlay. mouse_filter IGNORE so it never eats board/shop clicks.
+func _draw_game_background() -> void:
+	var bg = ColorRect.new()
+	bg.name = "GameBackground"
+	bg.color = BG_COLOR
+	bg.position = Vector2.ZERO
+	bg.size = get_viewport_rect().size
+	bg.z_index = -100
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(bg)
+	move_child(bg, 0)
+	# Keep it covering the window if the viewport is ever resized.
+	get_viewport().size_changed.connect(func(): bg.size = get_viewport_rect().size)
+
+
 func draw_board():
+	# Rainbow-hued board. The hue sweeps across the 15 diagonals (x + y = 0..14) so the
+	# whole spectrum flows corner-to-corner. The checker pattern is preserved entirely
+	# through VALUE (lightness): light squares stay bright, dark squares stay dim, so the
+	# grid reads clearly and the 3D pieces still pop on top — it's just tinted, not muddy.
 	for x in range(8):
 		for y in range(8):
 			var tile = ColorRect.new()
 			tile.size = Vector2(TILE_SIZE, TILE_SIZE)
 			tile.position = BOARD_OFFSET + Vector2(x * TILE_SIZE, y * TILE_SIZE)
+			var hue := float(x + y) / 14.0   # 0.0 (red) → 1.0 (back to red) across the diagonal
 			if (x + y) % 2 == 0:
-				tile.color = Color.WHITE
+				tile.color = Color.from_hsv(hue, 0.40, 0.95)  # light square: pastel, bright
 			else:
-				tile.color = Color.DIM_GRAY
+				tile.color = Color.from_hsv(hue, 0.65, 0.52)  # dark square: saturated, dim
 			add_child(tile)
 
 func draw_coordinates():
@@ -1559,8 +2291,8 @@ func draw_coordinates():
 		var letter = Label.new()
 		letter.add_to_group("coord_label")
 		letter.text = files[fi]
-		letter.add_theme_font_size_override("font_size", 18)
-		letter.position = Vector2(BOARD_OFFSET.x + x * TILE_SIZE + TILE_SIZE / 2.0 - 5, board_bottom + 5)
+		letter.add_theme_font_size_override("font_size", 26)
+		letter.position = Vector2(BOARD_OFFSET.x + x * TILE_SIZE + TILE_SIZE / 2.0 - 6, board_bottom + 5)
 		add_child(letter)
 	# Rank numbers down the left edge. Screen row y shows rank 8 - y normally, or y + 1
 	# when flipped (logical row 7 - y, whose rank is 8 - (7 - y) = y + 1).
@@ -1569,99 +2301,318 @@ func draw_coordinates():
 		var number = Label.new()
 		number.add_to_group("coord_label")
 		number.text = rank_text
-		number.add_theme_font_size_override("font_size", 18)
-		number.position = Vector2(BOARD_OFFSET.x - 20, BOARD_OFFSET.y + y * TILE_SIZE + TILE_SIZE / 2.0 - 12)
+		number.add_theme_font_size_override("font_size", 26)
+		number.position = Vector2(BOARD_OFFSET.x - 24, BOARD_OFFSET.y + y * TILE_SIZE + TILE_SIZE / 2.0 - 14)
 		add_child(number)
 
 func draw_shop_ui():
-	var start_x = 1120
-	
-	var current_y = 70 
-	
-	var item_spacing = 42 
-	
+	var start_x = 1110
+	var panel_w  = 200
+
+	# --- DATA ---
+	# Each item carries a short tooltip line shown on hover.
 	var shop_structure = {
-		"DEFENSE": [
-			{"name": "Ground", "cost": "$3", "desc": "1 Turn"},
-			{"name": "Shield", "cost": "$5", "desc": "1 Turn"}
-		],
-		"MOVEMENT": [
-			{"name": "Phase", "cost": "$6", "desc": "Instant"},
-			{"name": "Teleport", "cost": "$8", "desc": "Instant"}
-		],
-		"ATTACK": [
-			{"name": "Super Pawn", "cost": "$10", "desc": "Perm."},
-			{"name": "Capture", "cost": "$7", "desc": "Instant"}
-		],
-		"ECONOMY": [
-			{"name": "Multiply", "cost": "$2", "desc": "1 Turn"},
-			{"name": "Negate", "cost": "$4", "desc": "1 Turn"}
-		],
-		"UBER": [
-			{"name": "Cheat", "cost": "$15", "desc": "Instant"},
-			{"name": "Revive", "cost": "Dyn.", "desc": "Perm."}
-		]
+		"DEFENSE": {
+			"color": Color(0.37, 0.66, 0.91),   # steel blue
+			"items": [
+				{"name": "Ground",  "cost": "$3",  "desc": "Piece is immobilized and cannot be captured for 1 turn."},
+				{"name": "Shield",  "cost": "$5",  "desc": "Piece can't be captured for 1 turn. Can move but cannot capture while shielded."}
+			]
+		},
+		"AGILITY": {
+			"color": Color(0.78, 0.46, 0.94),   # purple
+			"items": [
+				{"name": "Phase",    "cost": "$6",  "desc": "Piece can phase through any one piece on its next move. Ends turn"},
+				{"name": "Teleport", "cost": "$8",  "desc": "Piece can teleport to any empty square once. Ends turn"}
+			]
+		},
+		"ATTACK": {
+			"color": Color(0.91, 0.36, 0.36),   # red
+			"items": [
+				{"name": "Capture",    "cost": "$7",  "desc": "Piece can move to capture any adjacent square, like a king"},
+				{"name": "Super Pawn", "cost": "$10", "desc": "SuperPawn can capture moving forwards & and move backwards. (Permanent buff)"}
+			]
+		},
+		"ECONOMY": {
+			"color": Color(0.34, 0.85, 0.45),   # green
+			"items": [
+				{"name": "Multiply", "cost": "$2", "desc": "Next capture earns double gold. Piece capture value is also doubled"},
+				{"name": "Negate",   "cost": "$4", "desc": "Opponent earns 0 gold if piece is captured."}
+			]
+		},
+		"UBER": {
+			"color": Color(1.0, 0.65, 0.0),     # gold-orange
+			"items": [
+				{"name": "Cheat",  "cost": "$15", "desc": "Legally move opponent's piece before your turn. Cannot capture cheated piece"},
+				# Empty cost string = no price on the button. Tap-In's price depends on BOTH
+				# pieces in the swap, so any single number printed here would be wrong; the
+				# real figures live on the board target squares once a bench piece is armed.
+				{"name": "Tap-In", "cost": "", "desc": "Swap a benched piece onto the board. The piece it replaces joins your bench. 3 subs per match. Price shows on each square."}
+			]
+		}
 	}
-	
+
+	# --- STONE PANEL BACKGROUND (sized after content is built) ---
+	# Nodes are created here but sized below once current_y is known.
+	var panel_bg = ColorRect.new()
+	panel_bg.color   = Color(0.22, 0.22, 0.29, 0.97)
+	panel_bg.z_index = -1
+	add_child(panel_bg)
+	var bevel_top = ColorRect.new()
+	bevel_top.color   = Color(0.42, 0.42, 0.52)
+	bevel_top.z_index = 0
+	add_child(bevel_top)
+	var bevel_left = ColorRect.new()
+	bevel_left.color   = Color(0.42, 0.42, 0.52)
+	bevel_left.z_index = 0
+	add_child(bevel_left)
+	var bevel_bot = ColorRect.new()
+	bevel_bot.color   = Color(0.10, 0.10, 0.14)
+	bevel_bot.z_index = 0
+	add_child(bevel_bot)
+	var bevel_right = ColorRect.new()
+	bevel_right.color   = Color(0.10, 0.10, 0.14)
+	bevel_right.z_index = 0
+	add_child(bevel_right)
+
+	# --- SHOP TITLE ---
 	var shop_title = Label.new()
-	shop_title.text = "--- ÜBERCHESS SHOP ---"
-	shop_title.position = Vector2(start_x - 20, current_y)
-	shop_title.add_theme_font_size_override("font_size", 22) # Larger Title
+	shop_title.text = "[ SHOP ]"
+	shop_title.add_theme_color_override("font_color", Color(1.0, 0.85, 0.25))
+	shop_title.add_theme_font_size_override("font_size", 22)
+	shop_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	shop_title.size = Vector2(panel_w, 24)
+	shop_title.position = Vector2(start_x, 66)
 	add_child(shop_title)
-	
-	current_y += 50 # A larger gap before the first class begins
-	
-	# Shared hover highlight; the empty focus box kills the lingering outline after a
-	# click. Background-only — font colors (affordability/selection) are separate.
-	var hover_sb = StyleBoxFlat.new()
-	hover_sb.bg_color = Color(0.85, 0.85, 0.9, 0.22)
-	hover_sb.set_corner_radius_all(5)
-	hover_sb.content_margin_left = 6
-	hover_sb.content_margin_right = 6
+
+	# --- TOOLTIP LABEL (single shared node, shown/hidden on hover) ---
+	var tooltip = Label.new()
+	tooltip.name = "ShopTooltip"
+	# Merchant Copy sets smaller on the body than Poxast at the same nominal size, so this
+	# runs well above the old 17 and still reads as the calmer of the two.
+	tooltip.add_theme_font_size_override("font_size", 37)
+	tooltip.add_theme_color_override("font_color", Color(0.86, 0.86, 0.97))
+	# Descriptions are SENTENCES, so they get the prose font (Merchant Copy) rather than
+	# Poxast. Poxast is a display face — wide, heavy, and genuinely hard to read once a
+	# string wraps to four lines. Setting the override here also opts this node out of
+	# _apply_body_font_to, which only fills in nodes that have not chosen a font.
+	if font_prose != null:
+		tooltip.add_theme_font_override("font", font_prose)
+	tooltip.z_index  = 10
+	tooltip.visible  = false
+	tooltip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	# custom_minimum_size.x MUST be the real box width. A Control's `size` is clamped up
+	# to its minimum, and an autowrapping Label computes its minimum HEIGHT at its minimum
+	# WIDTH — which, left at zero, is the longest single word. The Tap-In description then
+	# "wrapped" two characters per line and the box measured 1521px tall, swallowing the
+	# board. Pinning the minimum width makes the label's own wrap match the one measured
+	# below, so the height we compute is the height it actually gets.
+	tooltip.custom_minimum_size = Vector2(TIP_W, 0)
+
+	# Tooltip background panel
+	var tt_bg = StyleBoxFlat.new()
+	tt_bg.bg_color             = Color(0.10, 0.10, 0.16, 0.97)
+	tt_bg.border_color         = Color(0.38, 0.38, 0.50)
+	tt_bg.set_border_width_all(2)
+	tt_bg.content_margin_left  = 8
+	tt_bg.content_margin_right = 8
+	tt_bg.content_margin_top   = 6
+	tt_bg.content_margin_bottom = 6
+	tooltip.add_theme_stylebox_override("normal", tt_bg)
+	add_child(tooltip)
+
+	# --- SHARED BUTTON STYLEBOXES ---
+	# Normal state: inset stone look
+	var btn_normal = StyleBoxFlat.new()
+	btn_normal.bg_color             = Color(0.16, 0.16, 0.22)
+	btn_normal.border_color         = Color(0.10, 0.10, 0.14)
+	btn_normal.set_border_width_all(2)
+	btn_normal.content_margin_left  = 8
+	btn_normal.content_margin_right = 8
+	btn_normal.content_margin_top   = 5
+	btn_normal.content_margin_bottom = 5
+
+	# Hover state: slight stone highlight
+	var btn_hover = StyleBoxFlat.new()
+	btn_hover.bg_color             = Color(0.22, 0.22, 0.30)
+	btn_hover.border_color         = Color(0.50, 0.50, 0.62)
+	btn_hover.set_border_width_all(2)
+	btn_hover.content_margin_left  = 8
+	btn_hover.content_margin_right = 8
+	btn_hover.content_margin_top   = 5
+	btn_hover.content_margin_bottom = 5
+
+	# Pressed state: pushed-in inset
+	var btn_pressed = StyleBoxFlat.new()
+	btn_pressed.bg_color             = Color(0.11, 0.11, 0.16)
+	btn_pressed.border_color         = Color(0.10, 0.10, 0.14)
+	btn_pressed.set_border_width_all(2)
+	btn_pressed.content_margin_left  = 9
+	btn_pressed.content_margin_right = 7
+	btn_pressed.content_margin_top   = 6
+	btn_pressed.content_margin_bottom = 4
+
 	var empty_focus_sb = StyleBoxEmpty.new()
-	
+
+	# --- BUILD CATEGORIES ---
+	# Sizes are chosen so content stays within the panel (y=55 to y=900, board bottom).
+	# Title area: 55px (current_y starts at 110). 5 headers×38 + 10 buttons×55 + 5 gaps×8 = 780px → ends ~890.
+	const BTN_H    := 55
+	const HDR_H    := 38
+	const CAT_GAP  := 8
+	const BTN_FONT := 16
+	const HDR_FONT := 16
+	# Panel bounds. Declared HERE, above the build loop, because the hover handlers below
+	# close over them to keep tooltips inside the panel — a const declared after the
+	# lambda is not in scope for it.
+	# Board bottom = BOARD_OFFSET.y + 8*TILE_SIZE = 100 + 800 = 900.
+	const PANEL_TOP := 55.0
+	const BOARD_BOT := 900.0
+	# Tooltip box geometry, shared by the measure and the placement below.
+	var tip_pad_x := 16.0   # tt_bg content_margin_left + _right
+	var tip_pad_y := 12.0   # tt_bg content_margin_top + _bottom
+	# Right edge of the button column — the tooltip is right-aligned to it and grows
+	# LEFTWARD over the board. It is a hover overlay, so briefly covering a few squares
+	# costs nothing, and it is the only way to give the text a readable measure: at this
+	# font size the 192px panel width would wrap to about six characters a line.
+	var tip_right: float = start_x - 5 + panel_w + 10
+	var tip_x: float = tip_right - TIP_W
+	# Highest a tooltip may sit: clear of the "[ SHOP ]" title (y=66, ~24 tall) rather
+	# than merely inside the panel. Without this the top two buttons put their box over
+	# the title, which is the one label that should never be covered.
+	var tip_min_y := 96.0
+	var current_y: float = 110
+
 	for category in shop_structure.keys():
-		
+		var cat_data  = shop_structure[category]
+		var cat_color: Color = cat_data["color"]
+		var items: Array = cat_data["items"]
+
+		# Category header bar
+		var hdr_bg = ColorRect.new()
+		hdr_bg.color    = Color(cat_color.r * 0.18, cat_color.g * 0.18, cat_color.b * 0.22, 1.0)
+		hdr_bg.position = Vector2(start_x - 5, current_y)
+		hdr_bg.size     = Vector2(panel_w + 10, HDR_H)
+		add_child(hdr_bg)
+
+		var hdr_accent = ColorRect.new()
+		hdr_accent.color    = cat_color
+		hdr_accent.position = Vector2(start_x - 5, current_y)
+		hdr_accent.size     = Vector2(3, HDR_H)
+		add_child(hdr_accent)
+
 		var header = Label.new()
-		header.text = "[" + category + "]"
-		header.position = Vector2(start_x, current_y)
-		header.add_theme_color_override("font_color", Color(0.6, 0.8, 1.0)) 
-		header.add_theme_font_size_override("font_size", 20) # Larger Header
+		header.text = category
+		header.add_theme_color_override("font_color", cat_color)
+		header.add_theme_font_size_override("font_size", HDR_FONT)
+		# Centered by the layout engine rather than by arithmetic on HDR_FONT: the old
+		# formula used the UNSCALED constant, so any UI_FONT_SCALE above 1.0 pushed the
+		# glyphs below their bar and clipped them.
+		header.size = Vector2(panel_w, HDR_H)
+		header.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		header.clip_text = true
+		header.position = Vector2(start_x + 4, current_y)
 		add_child(header)
-		current_y += item_spacing
-		
-		for item in shop_structure[category]:
+		current_y += HDR_H
+
+		for item in items:
 			var item_btn = Button.new()
-			item_btn.text = item["name"] + " (" + item["cost"] + ")"
-			
-			item_btn.position = Vector2(start_x + 15, current_y - 5) 
-			item_btn.add_theme_font_size_override("font_size", 18)
-			
-			item_btn.flat = true 
-			
-			# Faint gray hover highlight (and no lingering focus outline after clicking).
-			item_btn.add_theme_stylebox_override("hover", hover_sb)
-			item_btn.add_theme_stylebox_override("hover_pressed", hover_sb)
-			item_btn.add_theme_stylebox_override("focus", empty_focus_sb)
-			
-			# Parse "$5" -> 5. Revive's dynamic cost is handled via the tray, not here.
+			# A blank cost means the item has no fixed price (Tap-In) — print the name
+			# alone rather than a placeholder like "Dyn.", which read as part of the name.
+			item_btn.text = item["name"] if item["cost"] == "" else item["name"] + "  " + item["cost"]
+			item_btn.position = Vector2(start_x - 5, current_y)
+			item_btn.custom_minimum_size = Vector2(panel_w + 10, BTN_H)
+			item_btn.size     = Vector2(panel_w + 10, BTN_H)
+			# clip_text stops "Super Pawn  $10" reporting a minimum width wider than the
+			# 210px button and stretching it off the shop panel. But clipping alone LIED:
+			# it chopped the final glyph and the shop advertised Super Pawn at "$1" instead
+			# of $10. So shrink the font until the string actually fits, and let clip_text
+			# be the backstop it was meant to be rather than the mechanism.
+			# Measured at the SCALED size but stored RAW, because _scale_text_node
+			# multiplies every font_size override by UI_FONT_SCALE afterwards.
+			var fit_font := BTN_FONT
+			if font_body != null:
+				var avail: float = panel_w + 10 - 16   # button width less its content margins
+				while fit_font > 10 and font_body.get_string_size(item_btn.text,
+						HORIZONTAL_ALIGNMENT_LEFT, -1, int(round(fit_font * UI_FONT_SCALE))).x > avail:
+					fit_font -= 1
+			item_btn.add_theme_font_size_override("font_size", fit_font)
+			item_btn.clip_text = true
+			item_btn.flat = false
+
+			item_btn.add_theme_stylebox_override("normal",        btn_normal)
+			item_btn.add_theme_stylebox_override("hover",         btn_hover)
+			item_btn.add_theme_stylebox_override("pressed",       btn_pressed)
+			item_btn.add_theme_stylebox_override("hover_pressed", btn_hover)
+			item_btn.add_theme_stylebox_override("focus",         empty_focus_sb)
+			item_btn.add_theme_stylebox_override("disabled",      btn_normal)
+
 			var cost_int = 0
-			if item["cost"] != "Dyn.":
+			if item["cost"] != "":
 				cost_int = int(item["cost"].replace("$", ""))
 
-			# Stash the cost on the button so refresh_shop_affordability() can recompute
-			# buyable/unaffordable coloring later without re-parsing the label text.
-			item_btn.set_meta("cost", cost_int)
+			item_btn.set_meta("cost",      cost_int)
 			item_btn.set_meta("item_name", item["name"])
 
-			# Wire the button up to a function, passing it the specific item's data
+			# Hover tooltip. The old placement used a FIXED 68px height guess, which was
+			# fine for a one-line description and ran the long ones (Tap-In, Cheat, Super
+			# Pawn) straight off the bottom of the panel and out of the window. So the box
+			# is MEASURED at hover time — get_multiline_string_size wraps the real string
+			# at the real width with the real font — and then clamped into the panel.
+			var tip_head = item["name"] if item["cost"] == "" else item["name"] + " (" + item["cost"] + ")"
+			var tip_text = tip_head + "\n" + item["desc"]
+			item_btn.mouse_entered.connect(func():
+				tooltip.text = tip_text
+				var tf: Font = tooltip.get_theme_font("font")
+				var ts: int  = tooltip.get_theme_font_size("font_size")
+				var tip_h: float = 40.0
+				if tf != null:
+					tip_h = tf.get_multiline_string_size(
+						tip_text, HORIZONTAL_ALIGNMENT_LEFT, TIP_W - tip_pad_x, ts).y + tip_pad_y
+				# Pin the box to a known size so autowrap can't lay it out any other way.
+				# Both, not just size: see the custom_minimum_size note at the declaration.
+				tooltip.custom_minimum_size = Vector2(TIP_W, tip_h)
+				tooltip.size = Vector2(TIP_W, tip_h)
+				# Read the height BACK before placing. Control.size is clamped to the
+				# combined minimum on assignment, and the label's own line metrics run a
+				# few pixels taller than get_multiline_string_size reports — so the box we
+				# actually got is the only number the clamp below may trust.
+				tip_h = tooltip.size.y
+
+				# Prefer above the button, fall back to below, then clamp to the panel. The
+				# clamp is last and unconditional, so a description longer than either gap
+				# still lands fully on-panel instead of hanging off an edge.
+				var tip_y: float = item_btn.position.y - tip_h - 4
+				if tip_y < tip_min_y:
+					tip_y = item_btn.position.y + BTN_H + 4
+				tip_y = min(tip_y, BOARD_BOT - 4 - tip_h)
+				tip_y = max(tip_y, tip_min_y)
+				tooltip.position = Vector2(tip_x, tip_y)
+				tooltip.visible  = true
+			)
+			item_btn.mouse_exited.connect(func():
+				tooltip.visible = false
+			)
+
 			item_btn.pressed.connect(self._on_shop_item_pressed.bind(item["name"], cost_int))
-
-			# Store the button node in our memory dictionary using the item's name as the key
 			shop_buttons[item["name"]] = item_btn
-
 			add_child(item_btn)
-			current_y += item_spacing
+			current_y += BTN_H
+
+		current_y += CAT_GAP
+
+	# --- SIZE PANEL TO BOARD BOTTOM --- (PANEL_TOP / BOARD_BOT declared above the loop)
+	var panel_h: float = BOARD_BOT - PANEL_TOP
+	panel_bg.position  = Vector2(start_x - 8, PANEL_TOP)
+	panel_bg.size      = Vector2(panel_w + 16, panel_h)
+	bevel_top.position = Vector2(start_x - 8, PANEL_TOP)
+	bevel_top.size     = Vector2(panel_w + 16, 3)
+	bevel_left.position = Vector2(start_x - 8, PANEL_TOP)
+	bevel_left.size     = Vector2(3, panel_h)
+	bevel_bot.position  = Vector2(start_x - 8, BOARD_BOT)
+	bevel_bot.size      = Vector2(panel_w + 16, 3)
+	bevel_right.position = Vector2(start_x + panel_w + 8, PANEL_TOP)
+	bevel_right.size     = Vector2(3, panel_h + 3)
 
 	# Paint initial affordability colors now that every button exists.
 	refresh_shop_affordability()
@@ -1779,6 +2730,15 @@ func _net_route(raw: String) -> void:
 			_net_on_opponent_left()
 		"REMATCH":
 			_net_on_rematch_request()
+		"RESIGN":
+			# Handled IMMEDIATELY rather than queued: a resignation ends the match no
+			# matter what is still sitting in the inbox, and the pump would otherwise
+			# replay dead actions on top of a finished game.
+			var quitter: String = str(msg.get("color", ""))
+			if quitter == "":
+				quitter = "Black" if my_side == "White" else "White"
+			_net_inbox.clear()
+			_apply_resignation(quitter)
 		"PROMOTION_CHOSEN":
 			# Buffer AND emit: if the replay is already parked on `await promotion_chosen`
 			# the emit unblocks it; if the pick arrived first, the buffer catches it.
@@ -1843,9 +2803,9 @@ func _apply_remote_action(msg: Dictionary):
 			net_applying_remote = true
 			_on_shop_item_pressed(bitem, int(powerup_costs.get(bitem, 0)))
 			net_applying_remote = false
-		"REVIVE":
+		"TAP_IN":
 			net_applying_remote = true
-			_do_revive(current_turn, int(msg.get("index", -1)), _arr2v(msg["tile"]))
+			_do_tapin(current_turn, int(msg.get("bench_index", -1)), _arr2v(msg["square"]))
 			net_applying_remote = false
 		_:
 			push_warning("Unhandled queued message type: " + str(msg.get("type", "")))
@@ -1885,10 +2845,11 @@ func _net_on_match_start(your_color: String) -> void:
 		# keeps it clear of any overlay too.
 		hud.position = Vector2(550, 72)
 		hud.z_index = 50
-		hud.add_theme_font_size_override("font_size", 16)
+		hud.add_theme_font_size_override("font_size", 19)
 		add_child(hud)
 	hud.text = "Online — you are " + my_side
 	hud.modulate = Color(0.6, 0.85, 1.0)
+	_refresh_resign_button()   # there's a match to concede now
 	update_visuals()
 
 func _net_on_error(message: String) -> void:
@@ -1938,13 +2899,13 @@ func _build_lobby_ui() -> void:
 
 	var title = Label.new()
 	title.text = "ÜBERCHESS — ONLINE"
-	title.add_theme_font_size_override("font_size", 30)
+	title.add_theme_font_size_override("font_size", 34)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	panel.add_child(title)
 
 	_lobby_status = Label.new()
 	_lobby_status.text = "Connecting…"
-	_lobby_status.add_theme_font_size_override("font_size", 16)
+	_lobby_status.add_theme_font_size_override("font_size", 19)
 	_lobby_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_lobby_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_lobby_status.custom_minimum_size = Vector2(400, 0)
@@ -1953,20 +2914,20 @@ func _build_lobby_ui() -> void:
 	_lobby_create_btn = Button.new()
 	_lobby_create_btn.text = "Create Room"
 	_lobby_create_btn.custom_minimum_size = Vector2(400, 52)
-	_lobby_create_btn.add_theme_font_size_override("font_size", 20)
+	_lobby_create_btn.add_theme_font_size_override("font_size", 22)
 	_lobby_create_btn.disabled = true
 	_lobby_create_btn.pressed.connect(self._on_create_room_pressed)
 	panel.add_child(_lobby_create_btn)
 
 	_lobby_code_label = Label.new()
 	_lobby_code_label.text = ""
-	_lobby_code_label.add_theme_font_size_override("font_size", 26)
+	_lobby_code_label.add_theme_font_size_override("font_size", 30)
 	_lobby_code_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	panel.add_child(_lobby_code_label)
 
 	var sep = Label.new()
 	sep.text = "— or join with a code —"
-	sep.add_theme_font_size_override("font_size", 14)
+	sep.add_theme_font_size_override("font_size", 16)
 	sep.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	panel.add_child(sep)
 
@@ -1975,7 +2936,7 @@ func _build_lobby_ui() -> void:
 	_lobby_code_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_lobby_code_input.max_length = 6
 	_lobby_code_input.custom_minimum_size = Vector2(400, 44)
-	_lobby_code_input.add_theme_font_size_override("font_size", 22)
+	_lobby_code_input.add_theme_font_size_override("font_size", 25)
 	# Pressing Enter in the field is the same as clicking Join.
 	_lobby_code_input.text_submitted.connect(func(_t): _on_join_room_pressed())
 	panel.add_child(_lobby_code_input)
@@ -1983,7 +2944,7 @@ func _build_lobby_ui() -> void:
 	_lobby_join_btn = Button.new()
 	_lobby_join_btn.text = "Join Room"
 	_lobby_join_btn.custom_minimum_size = Vector2(400, 52)
-	_lobby_join_btn.add_theme_font_size_override("font_size", 20)
+	_lobby_join_btn.add_theme_font_size_override("font_size", 22)
 	_lobby_join_btn.disabled = true
 	_lobby_join_btn.pressed.connect(self._on_join_room_pressed)
 	panel.add_child(_lobby_join_btn)
@@ -1991,7 +2952,7 @@ func _build_lobby_ui() -> void:
 	var back = Button.new()
 	back.text = "← Back to Menu"
 	back.custom_minimum_size = Vector2(400, 40)
-	back.add_theme_font_size_override("font_size", 16)
+	back.add_theme_font_size_override("font_size", 18)
 	back.pressed.connect(self._on_main_menu_pressed)
 	panel.add_child(back)
 
@@ -2044,7 +3005,7 @@ func _show_rematch_ui() -> void:
 
 	_rematch_status = Label.new()
 	_rematch_status.text = "Play again?"
-	_rematch_status.add_theme_font_size_override("font_size", 20)
+	_rematch_status.add_theme_font_size_override("font_size", 23)
 	_rematch_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_rematch_status.custom_minimum_size = Vector2(280, 0)
 	box.add_child(_rematch_status)
@@ -2052,14 +3013,14 @@ func _show_rematch_ui() -> void:
 	_rematch_button = Button.new()
 	_rematch_button.text = "Rematch"
 	_rematch_button.custom_minimum_size = Vector2(280, 46)
-	_rematch_button.add_theme_font_size_override("font_size", 18)
+	_rematch_button.add_theme_font_size_override("font_size", 20)
 	_rematch_button.pressed.connect(self._on_rematch_pressed)
 	box.add_child(_rematch_button)
 
 	var menu_btn = Button.new()
 	menu_btn.text = "Return to Menu"
 	menu_btn.custom_minimum_size = Vector2(280, 40)
-	menu_btn.add_theme_font_size_override("font_size", 16)
+	menu_btn.add_theme_font_size_override("font_size", 18)
 	menu_btn.pressed.connect(self._on_main_menu_pressed)
 	box.add_child(menu_btn)
 
@@ -2106,7 +3067,8 @@ func _do_rematch() -> void:
 
 	# Reset all gameplay state to the opening position.
 	player_gold = {"White": 10, "Black": 10}
-	captured_pieces = {"White": [], "Black": []}
+	bench = {"White": [], "Black": []}
+	subs_left = {"White": SUBS_PER_MATCH, "Black": SUBS_PER_MATCH}
 	powerup_slots = {"White": [], "Black": []}
 	current_turn = "White"
 	selected_square = Vector2(-1, -1)
@@ -2115,13 +3077,20 @@ func _do_rematch() -> void:
 	held_slot_index = -1
 	used_classes_this_turn = []
 	cheat_protected_square = Vector2(-1, -1)
-	revive_pending = {}
+	tapin_pending = {}
+	tapin_selecting = false
 	game_over = false
 	winner = ""
 	is_draw = false
 	in_check = false
+	won_by_king_capture = false
+	won_by_resignation = false
+	resigned_color = ""
 	_net_promo_choice = ""
 	initialize_board()
+	if fx != null:
+		fx.clear_all()
+	_refresh_resign_button()   # the match is live again — re-arm the button
 
 	# Redraw everything for the fresh game.
 	update_gold_display()
@@ -2154,7 +3123,7 @@ func _show_net_notice(message: String) -> void:
 
 	var lbl = Label.new()
 	lbl.text = message
-	lbl.add_theme_font_size_override("font_size", 22)
+	lbl.add_theme_font_size_override("font_size", 25)
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	lbl.custom_minimum_size = Vector2(360, 0)
@@ -2163,7 +3132,7 @@ func _show_net_notice(message: String) -> void:
 	var btn = Button.new()
 	btn.text = "Return to Menu"
 	btn.custom_minimum_size = Vector2(360, 48)
-	btn.add_theme_font_size_override("font_size", 18)
+	btn.add_theme_font_size_override("font_size", 20)
 	btn.pressed.connect(self._on_main_menu_pressed)
 	box.add_child(btn)
 
@@ -2174,6 +3143,10 @@ func _show_net_notice(message: String) -> void:
 
 func _input(event):
 	if game_over or is_animating:
+		return
+
+	# A modal confirm (resign) is up — the board is frozen underneath it.
+	if _confirm_open:
 		return
 
 	if vs_bot and current_turn == bot_color:
@@ -2188,12 +3161,13 @@ func _input(event):
 			return
 		
 	if event is InputEventMouseButton and event.pressed:
-		# RIGHT CLICK: Drop the item and cancel the purchase / revive
+		# RIGHT CLICK: Drop the item and cancel the purchase / tap-in
 		if event.button_index == MOUSE_BUTTON_RIGHT:
-			if not revive_pending.is_empty():
-				print("✨ Revive canceled.")
-				revive_pending = {}
+			if not tapin_pending.is_empty():
+				print("🔄 Tap-in canceled.")
+				tapin_pending = {}
 				update_visuals()
+				update_captured_display()
 			cancel_powerup()
 			
 		# LEFT CLICK: Proceed with normal board interaction
@@ -2274,7 +3248,7 @@ func execute_cheat_move(from_pos: Vector2, to_pos: Vector2):
 	await get_tree().process_frame
 	_hide_piece_at(from_pos)
 	_hide_piece_at(to_pos)
-	await _slide_piece(slide_path, from_pos, to_pos)
+	await _slide_piece(slide_path, from_pos, to_pos, 0.22, piece["type"])
 	is_animating = false
 
 	board_state.erase(from_pos)
@@ -2297,14 +3271,15 @@ func execute_cheat_move(from_pos: Vector2, to_pos: Vector2):
 	update_visuals()
 
 func handle_click(clicked_pos: Vector2):
-	# REVIVE PLACEMENT MODE: a revive is waiting for a target starting square.
-	if not revive_pending.is_empty():
-		if clicked_pos in revive_pending["candidates"]:
-			_do_revive(revive_pending["owner"], revive_pending["index"], clicked_pos)
+	# TAP-IN TARGET MODE: a benched piece is armed and waiting for the piece it replaces.
+	if not tapin_pending.is_empty():
+		if clicked_pos in tapin_pending["targets"]:
+			_do_tapin(tapin_pending["owner"], tapin_pending["index"], clicked_pos)
 		else:
-			print("✨ Revive canceled.")
-			revive_pending = {}
+			print("🔄 Tap-in canceled.")
+			tapin_pending = {}
 			update_visuals()
+			update_captured_display()
 		return
 
 	# SCENARIO 0: holding a power-up from the shop
@@ -2347,6 +3322,9 @@ func handle_click(clicked_pos: Vector2):
 			update_visuals()
 
 func update_visuals():
+	# Keep the resign button honest with the match state (live / decided / pre-lobby).
+	_refresh_resign_button()
+
 	# --- 1. UPDATE TURN INDICATOR UI ---
 	var indicator = get_node_or_null("TurnIndicator")
 	if indicator:
@@ -2354,6 +3332,12 @@ func update_visuals():
 			if is_draw:
 				indicator.text = "Stalemate — Draw!"
 				indicator.modulate = Color(0.75, 0.75, 0.75)
+			elif won_by_resignation:
+				indicator.text = winner + " wins by resignation!"
+				indicator.modulate = Color(1, 0.84, 0)
+			elif won_by_king_capture:
+				indicator.text = winner + " captures the King!"
+				indicator.modulate = Color(1, 0.84, 0)
 			else:
 				indicator.text = "Checkmate! " + winner + " wins!"
 				indicator.modulate = Color(1, 0.84, 0)
@@ -2364,10 +3348,12 @@ func update_visuals():
 				indicator.modulate = Color(1, 0.3, 0.3)
 			else:
 				indicator.text = base
-				indicator.modulate = Color.WHITE if current_turn == "White" else Color.BLACK
-		# While placing a revive, the indicator becomes a placement prompt.
-		if not revive_pending.is_empty():
-			indicator.text = "Revive " + revive_pending["type"] + " — pick a square"
+				# Pure black vanishes on the dark stone background, so Black's turn uses a
+				# light slate that still reads as "the dark side" while staying legible.
+				indicator.modulate = Color.WHITE if current_turn == "White" else Color(0.62, 0.62, 0.70)
+		# While a tap-in is armed, the indicator becomes the substitution prompt.
+		if not tapin_pending.is_empty():
+			indicator.text = "Tap in " + tapin_pending["type"] + " — pick a piece"
 			indicator.modulate = Color(0.2, 0.9, 0.9)
 
 	# --- 2. DESTROY OLD VISUALS ---
@@ -2391,16 +3377,32 @@ func update_visuals():
 		highlight.z_index = 0
 		add_child(highlight)
 
-	# --- 3.5. DRAW REVIVE CANDIDATE SQUARES (cyan, behind pieces) ---
-	if not revive_pending.is_empty():
-		for tile in revive_pending["candidates"]:
-			var rev = ColorRect.new()
-			rev.add_to_group("dynamic_overlay")
-			rev.size = Vector2(TILE_SIZE, TILE_SIZE)
-			rev.position = BOARD_OFFSET + (_disp(tile) * TILE_SIZE)
-			rev.color = Color(0.2, 0.9, 0.9, 0.45)
-			rev.z_index = 0
-			add_child(rev)
+	# --- 3.5. DRAW TAP-IN SWAP TARGETS (cyan wash + price tag) ---
+	# The price rides the TARGET, not the bench icon: cost depends on who comes off, so
+	# the same benched Queen is $1 over a Rook and $17 over a Pawn. Showing it per square
+	# is the only place the number is actually true.
+	if not tapin_pending.is_empty():
+		var in_type: String = tapin_pending["type"]
+		for tile in tapin_pending["targets"]:
+			var swap = ColorRect.new()
+			swap.add_to_group("dynamic_overlay")
+			swap.size = Vector2(TILE_SIZE, TILE_SIZE)
+			swap.position = BOARD_OFFSET + (_disp(tile) * TILE_SIZE)
+			swap.color = Color(0.2, 0.9, 0.9, 0.45)
+			swap.z_index = 0
+			add_child(swap)
+
+			# Price tag, above the sprite so it stays readable over the piece art.
+			var tag := Label.new()
+			tag.add_to_group("dynamic_overlay")
+			tag.text = "$" + str(tapin_cost(in_type, board_state[tile]["type"]))
+			tag.add_theme_font_size_override("font_size", 18)   # raw; _scale_text_node applies UI_FONT_SCALE
+			tag.add_theme_color_override("font_color", Color(0.15, 0.15, 0.2))
+			tag.add_theme_color_override("font_outline_color", Color(0.55, 1.0, 1.0))
+			tag.add_theme_constant_override("outline_size", 6)
+			tag.position = BOARD_OFFSET + (_disp(tile) * TILE_SIZE) + Vector2(4, 2)
+			tag.z_index = 10
+			add_child(tag)
 
 	# --- 4. DRAW PIECES ---
 	spawn_visual_pieces()

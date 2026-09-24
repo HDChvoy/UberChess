@@ -9,6 +9,22 @@ extends Control
 # Board scene the play buttons load. Match your actual filename/capitalization.
 const GAME_SCENE_PATH := "res://Game.tscn"
 
+# Pixel-font typography (same files game.gd uses; drop them in res://fonts/). Roles:
+#   body    — Merchant Copy: clean pixel type, the global font for ALL menu text
+#             (buttons, notes, AND the page headings) so the menu reads as one voice.
+#   title   — Poxast: bold chunky display font, used ONLY for the "ÜBERCHESS" wordmark.
+#             Poxast has its own "Ü" (the cube-style umlaut you see in the title).
+#   heading — CoralPixels: kept loaded purely as a last-resort glyph fallback for the
+#             wordmark's "Ü", so the title can never render as an empty box even if the
+#             Poxast file is missing. It is NOT used as a visible UI font anywhere.
+# Any missing file degrades to the default font, so a fresh checkout never crashes.
+const FONT_BODY_PATH := "res://text fonts/merchant-copy/Merchant Copy.ttf"
+const FONT_TITLE_PATH := "res://text fonts/poxast/Poxast-Regular.ttf"
+const FONT_HEADING_PATH := "res://text fonts/coral-pixels/CoralPixels-Regular.ttf"
+var font_body: Font = null
+var font_title: Font = null
+var font_heading: Font = null
+
 var _main_page: CenterContainer
 var _local_page: CenterContainer
 var _difficulty_page: CenterContainer
@@ -16,6 +32,9 @@ var _difficulty_page: CenterContainer
 func _ready():
 	# Make the root fill the whole window so the centered layout actually centers.
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	# Pixelate all menu text before any labels/buttons are built, so they inherit it.
+	_load_ui_fonts()
 
 	# Full-screen dark background.
 	var bg := ColorRect.new()
@@ -36,6 +55,60 @@ func _ready():
 	add_child(_local_page)
 	add_child(_difficulty_page)
 	_show(_main_page)
+
+# Loads a pixel .ttf and switches off antialiasing/hinting/subpixel so the glyphs stay
+# crisp and blocky. Returns null if the file isn't present, logging the outcome so the
+# Output panel shows exactly which fonts resolved.
+func _load_pixel_font(path: String, label: String) -> Font:
+	if not ResourceLoader.exists(path):
+		print("⚠️ Font NOT FOUND (", label, "): ", path)
+		return null
+	var f = load(path)
+	if f is FontFile:
+		f.antialiasing = TextServer.FONT_ANTIALIASING_NONE
+		f.hinting = TextServer.HINTING_NONE
+		f.subpixel_positioning = TextServer.SUBPIXEL_POSITIONING_DISABLED
+		f.force_autohinter = false
+	print("✓ Loaded ", label, " font: ", path)
+	return f
+
+# Loads the pixel-font set and applies the body font (Merchant Copy) to every text node
+# via direct per-node overrides (the reliable mechanism — see game.gd notes), connecting
+# to node_added so pages/buttons built later are caught too. Also sets the global fallback
+# so the pixel look carries into the game scene. CoralPixels is chained ONLY as a fallback
+# on the TITLE font, so the wordmark's "Ü" still resolves if the Poxast file is ever
+# missing — body text never borrows a foreign glyph, so it stays in one consistent font.
+func _load_ui_fonts() -> void:
+	font_body = _load_pixel_font(FONT_BODY_PATH, "body")
+	font_title = _load_pixel_font(FONT_TITLE_PATH, "title")
+	font_heading = _load_pixel_font(FONT_HEADING_PATH, "heading")
+	if font_body == null:
+		print("ℹ️ Body font missing — menu text stays default. Fix FONT_BODY_PATH above.")
+		return
+	# Safety net for the wordmark only: if Poxast lacks "Ü", pull it from CoralPixels.
+	# Poxast normally has its own "Ü", so this fallback is dormant in practice.
+	if font_title != null and font_title is FontFile and font_heading != null:
+		var tfs: Array[Font] = [font_heading]
+		font_title.fallbacks = tfs
+	ThemeDB.fallback_font = font_body  # carries into the game scene
+	get_tree().node_added.connect(_apply_body_font_to)
+	_apply_body_font_recursive(self)
+	print("🔡 Pixel fonts loaded — menu text is now pixelated.")
+
+# Applies the body font to a single node IF it's a text node without a font already
+# chosen (so the title/headings keep their own fonts).
+func _apply_body_font_to(node: Node) -> void:
+	if font_body == null:
+		return
+	if node is Label or node is Button or node is LineEdit:
+		if not node.has_theme_font_override("font"):
+			node.add_theme_font_override("font", font_body)
+
+# One-time walk over whatever UI already exists when the fonts finish loading.
+func _apply_body_font_recursive(node: Node) -> void:
+	_apply_body_font_to(node)
+	for c in node.get_children():
+		_apply_body_font_recursive(c)
 
 # Builds a soft, dimmed chessboard that sits behind the menu — the same darkened-board
 # mood as the multiplayer lobby, rendered here as a blurred backdrop since the menu scene
@@ -114,6 +187,8 @@ func _build_main_page() -> CenterContainer:
 	title.text = "ÜBERCHESS"
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.add_theme_font_size_override("font_size", 84)
+	if font_title != null:
+		title.add_theme_font_override("font", font_title)
 	col.add_child(title)
 
 	var spacer := Control.new()
@@ -135,6 +210,9 @@ func _build_local_page() -> CenterContainer:
 	heading.text = "Play Local"
 	heading.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	heading.add_theme_font_size_override("font_size", 64)
+	# No font override: the node_added hook applies the body font (Merchant Copy), so the
+	# heading matches the buttons below it — just larger. (Was CoralPixels, which rendered
+	# as multicolor noise at this size.)
 	col.add_child(heading)
 
 	var spacer := Control.new()
@@ -142,12 +220,14 @@ func _build_local_page() -> CenterContainer:
 	col.add_child(spacer)
 
 	col.add_child(_make_button("Play 2-Player", _on_two_player_pressed))
-	col.add_child(_make_button("Play Über Bot", _on_show_difficulty))
+	# Plain "U": Merchant Copy has no "Ü", so an umlaut here would borrow a foreign glyph
+	# and break the consistent button look. The wordmark keeps the umlaut; buttons don't.
+	col.add_child(_make_button("Play Uber Bot", _on_show_difficulty))
 
 	var back_spacer := Control.new()
 	back_spacer.custom_minimum_size = Vector2(0, 18)
 	col.add_child(back_spacer)
-	col.add_child(_make_button("\u2190 Back", _on_show_main))
+	col.add_child(_make_button("< Back", _on_show_main))
 	return _page_wrapper(col)
 
 # --- PAGE 3: BOT DIFFICULTY SELECT ---
@@ -158,6 +238,7 @@ func _build_difficulty_page() -> CenterContainer:
 	heading.text = "Select Difficulty"
 	heading.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	heading.add_theme_font_size_override("font_size", 56)
+	# Body font (Merchant Copy) via the node_added hook — consistent with every other page.
 	col.add_child(heading)
 
 	var note := Label.new()
@@ -174,12 +255,12 @@ func _build_difficulty_page() -> CenterContainer:
 	col.add_child(_make_button("Easy", _on_difficulty_pressed.bind(GameConfig.Difficulty.EASY)))
 	col.add_child(_make_button("Normal", _on_difficulty_pressed.bind(GameConfig.Difficulty.NORMAL)))
 	col.add_child(_make_button("Hard", _on_difficulty_pressed.bind(GameConfig.Difficulty.HARD)))
-	col.add_child(_make_button("\u00dcber", _on_difficulty_pressed.bind(GameConfig.Difficulty.UBER)))
+	col.add_child(_make_button("Uber", _on_difficulty_pressed.bind(GameConfig.Difficulty.UBER)))
 
 	var back_spacer := Control.new()
 	back_spacer.custom_minimum_size = Vector2(0, 18)
 	col.add_child(back_spacer)
-	col.add_child(_make_button("\u2190 Back", _on_show_local))
+	col.add_child(_make_button("< Back", _on_show_local))
 	return _page_wrapper(col)
 
 # --- PAGE SWITCHING ---

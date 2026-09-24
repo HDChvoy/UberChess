@@ -1,0 +1,1698 @@
+ÜBERCHESS - MASTER GAME DESIGN DOCUMENT & SCRIPT
+
+By Henry David Chvoy
+Project Engine: Godot 4 (GDScript)
+Last Updated: September 2, 2026
+Status: Playable Alpha — entering the PRESENTATION PASS.
+
+    All three modes launch from the menu and run: Local 2-Player, Vs UberBot,
+    Online Multiplayer. All 10 power-ups are implemented end-to-end (9 slotted +
+    Tap-in, which replaced Revive outright in this revision — see 3.2). Online play
+    is fully integrated against the live Phase 1 WebSocket relay (lobby, per-side
+    board flip, opponent-action replay, promotion sync, disconnect handling, rematch).
+    The UberBot runs a full negamax search, a 96-line opening book, and a hardcoded
+    power-up rule book with a single difficulty-scaled aggression dial (Section 8).
+
+HOW TO READ THIS DOCUMENT
+    Every section carries a status tag. The codebase and this document have drifted
+    apart before; the tags exist so they can't again.
+
+        [BUILT]      Implemented and playable today.
+        [PARTIAL]    Some of it ships; the gaps are named inline.
+        [DESIGN]     Specified here, NOT in the code yet. Do not assume it exists.
+        [FROZEN]     Built, working, and deliberately closed to further work.
+
+    CHANGED IN THIS REVISION (Aug 26) — THE POWER-UP POLICY REWRITE AND TURN PACING.
+        Two related things landed, both driven by the same observed failure: the bot
+        spent a $4 Negate on a $1 pawn while a $3 Ground sat ready in the next slot,
+        and used a power-up once in an entire game.
+
+        - NEW FILE: UberbotPowerupPolicy.gd — a HARDCODED power-up rule book. Power-up
+          choice is no longer a search problem. The rule book DECIDES; the search only
+          VETOES. See 8.4, which is rewritten end to end.
+        - The bot's power-up behaviour is now ONE NUMBER: `aggression`, 0.0–2.0, set
+          per difficulty in GameConfig. This is the DJ board from 8.6, shipped.
+        - DELETED from UberbotStrategy: SPEND_TIERS, PU_SEARCH_MARGIN,
+          MARGIN_COST_COEF, FORCED_USE_*, MAX_TARGETS_PER_TYPE, USE_PROB, BUY_WEIGHTS,
+          FULL_SLOTS_BONUS, MAX_SCORED_CANDIDATES and every *_MIN_VALUE threshold,
+          plus _gen_powerup_candidates, _layer_economy and the heuristic buy roll.
+          Anywhere this document still named one of those, it is now wrong on purpose
+          — they are gone. The strategy shrank by roughly 40%.
+        - BOT TURN PACING IS NOW A FIXED 4 SECONDS, replacing the 1.6s think pause and
+          the 1.5s inter-action gaps. Section 6.5 is rewritten; this changes the FX
+          budget's arithmetic, not its conclusion.
+        - GameConfig owns BOT_TURN_SECONDS and bot_plan_budget_ms() so game.gd and
+          UberbotStrategy cannot drift on the number. Über's think_ms dropped
+          3000 → 2400 so the veto pass fits inside the turn. See Section 9.
+
+    DRIFT CORRECTED IN THE PREVIOUS REVISION (kept for history):
+        - Multiply was a SEARCHED candidate, not a heuristic one. (Superseded: as of
+          this revision Multiply is a RULE, like everything else. See 8.4.)
+        - Step 3 "slice 4 — gold income in search" is PARTIALLY landed at root level,
+          not pending.
+        - UberbotOpenings.gd (the 96-line opening book) was missing from the FILES
+          list and from the bot section entirely. It is now Section 8.1.
+        - game.gd's declaration comment on captured_pieces read "Pieces each side
+          has captured", which was wrong — record_capture() files under the VICTIM's
+          color. CORRECTED: the var is now `bench` and the comment states the
+          ownership direction explicitly (3.2).
+        - The shop blurb claimed Revive cost "2 * piece value" while piece_rules
+          priced a Pawn at $4. CORRECTED: both are gone, replaced by the Tap-in
+          formula and a blurb that states it (3.2).
+
+CURRENT FOCUS — THE PRESENTATION PASS
+    The systems work. The game does not yet LOOK like its systems. Every power-up
+    is a static sprite.modulate tint over a PNG; the $15 Cheat is visually identical
+    to a normal move; a Shield blocking a capture is completely invisible. That is
+    the gap the next phase closes.
+
+    Four workstreams, in dependency order (Section 13 has the full roadmap):
+
+        1. FX & ANIMATION SYSTEM (Section 6) — the fx.gd module, shaders, particles,
+           and a cast/state/payoff beat for every power-up. FIRST, because Tap-in and
+           Themes both hook into it.
+        2. TAP-IN (Section 3) — LANDED. Revive is retired; the captured tray is THE
+           BENCH and pieces are substituted, not resurrected. Only the FX beat (the
+           bench-to-board crossing) is still outstanding, and it waits on fx.gd.
+        3. THEMES (Section 7) — ChessTheme resource + ThemeManager autoload: fonts,
+           piece art, board colors, and the FX palette as one swappable preset.
+        4. OPTIONS SCREEN (Section 10) — promoted from a stub. Themes, FX speed, and
+           volume all route through it, so it is now load-bearing.
+
+    The UberBot is FROZEN on STRENGTH (Section 8) — nothing on the search remains
+    open. Its POWER-UP POLICY was reopened and rewritten on Aug 26 after a playtest in
+    which the bot used a power-up once in an entire game, and used it wrongly: power-up
+    choice is now a hardcoded rule book (UberbotPowerupPolicy.gd) that DECIDES, with
+    the search demoted to a veto on blunders. Everything else in the bot backlog is
+    deferred behind the win-condition rework.
+
+    Running alongside: the WIN-CONDITION REWORK — the King is a real, capturable
+    piece and taking it is the win. Slice 1 (the king-capture primitive) is in and
+    dormant; Slices 2–4 are pending and deliberately NOT scheduled against Tap-in,
+    since both touch the same terminal-action path. See Section 4 and Section 13.
+
+FILES
+    Godot:  game.gd · uber_bot.gd · UberbotStrategy.gd · UberbotPowerupPolicy.gd ·
+            UberbotOpenings.gd · main_menu.gd · GameConfig.gd
+    Planned: fx.gd · ChessTheme.gd · ThemeManager.gd · options_menu.gd  [DESIGN]
+    Server: server.js · package.json · .gitignore
+    Repo:   https://github.com/HDChvoy/uberchess-relay
+    Live:   wss://uberchess-relay-production.up.railway.app
+
+================================================================================
+1. THE ECONOMY SYSTEM                                                    [BUILT]
+================================================================================
+
+    Starting cash: White and Black each start with $10.
+
+    Income:
+        $2 for putting the opponent in check.
+        Piece value on capture: Pawn=$1, Knight=$3, Bishop=$3, Rook=$5, Queen=$9.
+        Capture modifiers (priority order):
+            Negate on victim    → capturer earns $0.
+            Multiply on victim  → capturer earns the boosted value.
+            Multiply on attacker → capturer earns the boosted value.
+
+    Multiply boost formula:
+        Normal Pawn → $4 (quadrupled).
+        Super Pawn  → $16 (base $8, doubled).
+        All others  → base value × 2.
+
+    Gold sinks: the 9 slotted power-ups (Section 3) and Tap-in (Section 3.2). With
+        Revive retired, Tap-in becomes the only VARIABLE-cost sink, and the only one
+        that scales with what is actually on the board — see 3.2's cost formula.
+
+    UI: white_gold_label / black_gold_label track player_gold live.
+    refresh_shop_affordability() runs on every gold/slot change so shop button
+    colors stay honest.
+
+    [DESIGN] Gold should MOVE when it changes. Section 6.4 specifies coins flying
+        from the captured square to the owner's bank label on payout, and a shake-
+        without-increment on a Negated capture. Income is currently a silent number
+        change, which is the single cheapest satisfaction win available.
+
+================================================================================
+2. CORE MECHANIC: POWER-UP CLASSES & TURN LIMITS                         [BUILT]
+================================================================================
+
+    Classes: Defense, Agility, Attack, Economy, Uber.
+
+    Class limit: one ability USE per class per turn (used_classes_this_turn, cleared
+    at each turn swap). Buying has no class limit — only gold and slot count matter.
+
+    Exclusions:
+        - Power-ups may not target the King.
+        - Super Pawns may not receive any power-up.
+        - A piece carries at most ONE modifier per turn (no stacking).
+        - [RETIRED] "Revived pieces (is_revived) may never be revived again."
+          The is_revived flag and the rule it enforced are removed with Revive.
+          Tap-in's limiter is the per-match sub budget instead — see 3.2.
+
+    Slot system (3 visible slots per side):
+        - Buying drops a power-up into a slot flagged ready=false.
+        - Slots flip ready=true at the START of the owner's next turn (ready_slots()),
+          so a power-up is never usable on the turn it was bought.
+        - Both players' slot rows are always visible (open information).
+        - The active player clicks a ready slot to hold it (held_powerup /
+          held_slot_index), then clicks a target. The slot is consumed only on
+          successful application.
+
+    Tap-in is NOT slotted. Like Revive before it, it is driven from the gutter tray
+        and shares the Uber class with Cheat (one Uber action per turn).
+
+================================================================================
+3. THE POWER-UP SHOP (9 SLOTTED ITEMS + TAP-IN)
+================================================================================
+
+3.1 THE NINE SLOTTED POWER-UPS                                           [BUILT]
+
+    Price is deducted at purchase; the effect fires when the player later applies
+    the power-up from its slot. Each entry now also carries its FX brief — the
+    cast / state / payoff beats specified in Section 6. Those beats are [DESIGN];
+    the mechanics above them are [BUILT].
+
+    --- DEFENSE ---
+
+    Ground ($3) — Duration: 1 owner turn
+        Effect:  Grounded piece cannot move for one full cycle and cannot be
+                 captured (is_invulnerable()).
+        Visual:  Brown tint (0.6, 0.4, 0.2).
+        FX brief [DESIGN]: the HEAVY one. Square cracks, stone chunks erupt outward,
+                 the piece drops with a hard squash, dust settles. For the duration it
+                 gets a dark weighted base and ZERO idle animation — it is the only
+                 effect in the game that holds perfectly still, and that contrast is
+                 what sells the weight. Ground is also the one buff that BLOCKS
+                 tap-out (3.2), so its stillness reads as "locked in", not just "safe".
+        Bot:     RULE "save", rank 100. Fires on a HANGING piece worth >= bar(3).
+                 First rung of the Rule B ladder — at $3 it is the cheapest thing
+                 that makes a piece uncapturable, so it beats Shield and Teleport on
+                 the same target. Immobilising is free here: the rule never targets
+                 the piece the bot is about to move.
+
+    Shield ($5) — Duration: 1 owner turn
+        Effect:  Piece may move but CANNOT capture (move-list filter). It still
+                 threatens squares — a shielded piece can give check. Cannot be
+                 captured (is_invulnerable()).
+        Visual:  Translucent blue bubble (Polygon2D + Line2D rim) over the piece,
+                 drawn for all shielded pieces at once.
+        FX brief [DESIGN]: the bubble is already the best visual in the game; it just
+                 never ARRIVES or DEPARTS. Cast: scale in from 0 with an elastic
+                 overshoot, hex-facet shader flicker. Payoff: when it actually blocks
+                 a capture it FLASHES AND SHATTERS. Blocking is presently invisible,
+                 which means the rule teaches itself to nobody.
+        Bot:     RULE "save", rank 100, second rung. Same trigger as Ground but $5, so
+                 it wins only when Ground is absent from the rack OR when the Ground
+                 proposal on the same square was VETOED — a vetoed proposal claims
+                 neither its class nor its target, so the next rung is tried. Ground
+                 immobilises, so it is the rung more likely to be vetoed. CAUTION: Shield
+                 strips the carrier's own captures, so shielding a defender removes
+                 the recapture holding a square — this is why the veto subtracts
+                 SHIELD_BONUS before comparing (8.4).
+
+    --- AGILITY ---  (both consumed at turn end by _finish_turn)
+
+    Phase ($6) — Duration: Instant
+        Effect:  Sliding moves pass through exactly ONE blocker per direction, then
+                 stop (get_sliding_moves phase=true). Normal capture/invulnerability
+                 rules apply to the landing square. Threat scans use normal geometry.
+        Visual:  Yellow translucent tint (1.0, 0.9, 0.15, 0.6).
+        FX brief [DESIGN]: translucency + 2–3 afterimage ghosts trailing along the
+                 path. The slide must visibly ENTER and EXIT the blocked square —
+                 that single frame is the entire fantasy of the power-up, and today
+                 the piece just slides past like nothing was there.
+        Bot:     RULE "win material", rank 90. Fires when the phase geometry unlocks
+                 a capture worth >= bar(3) that is safe after the fact. Replaces the
+                 terminal move rather than adding to it.
+
+    Teleport ($8) — Duration: Instant
+        Effect:  Relocate to ANY empty square, ignoring geometry.
+        Visual:  Purple tint (0.6, 0.2, 0.85).
+        FX brief [DESIGN]: MUST NOT SLIDE. Implode at source (particles inward,
+                 sprite scales to zero with a vertical stretch), one beat of nothing,
+                 explode outward at the destination. Routing Teleport through
+                 _slide_piece undercuts the whole power-up; it needs its own path.
+        Bot:     RULE "escape", rank 100, third rung of the Rule B ladder
+                 (ESCAPE_BASELINE_VALUE). $8, so it needs a hanging piece worth
+                 >= bar(3) with a safe landing square. It is ranked below Ground and
+                 Shield on the SAME piece, but being Agility rather than Defense it can
+                 still fire in the same turn as a Ground on a DIFFERENT piece.
+
+    --- ATTACK ---
+
+    Super Pawn ($10) — Duration: Permanent (is_super_pawn)
+        Effect:  Upgrades a Pawn to expanded geometry: move/capture straight forward
+                 OR backward one square; capture-only on the two forward diagonals;
+                 en passant on forward diagonals. Its geometry runs in threat scans.
+                 Auto-promotes to Queen at the far rank (sheds is_super_pawn, no picker).
+        Visual:  Dedicated SuperPawn art (both colors).
+        Rules:   Non-Pawns can't receive it; Super Pawns can't receive further power-ups.
+                 A Super Pawn KEEPS its status across a tap-out/tap-in cycle (3.2) —
+                 it is the star player, and rotating it should not demote it.
+        FX brief [DESIGN]: the biggest transformation moment in the game, and it should
+                 not apologize for it. Light beam, art swap concealed inside the flash,
+                 a held pose, ~1.2s. This piece is the app icon and the visual identity
+                 of Überchess; every other effect is budgeted at half a second so this
+                 one can afford its full beat.
+        Bot:     RULE "super pawn", rank 55. Needs advancement >= bar(3) ranks, and
+                 never sinks $10 into a pawn that is hanging.
+
+    Capture ($7) — Duration: Instant
+        Effect:  Adds king-style one-square moves/captures in all 8 directions on top
+                 of normal geometry (add_capture_king_moves()). Invulnerability still
+                 blocks landing on a shielded/grounded enemy.
+        Visual:  Hot magenta tint (1.0, 0.2, 0.7).
+        FX brief [DESIGN]: magenta spikes stab outward in all 8 directions, briefly.
+                 An effect that TEACHES ITS OWN RULE — the player sees exactly which
+                 squares the buff just unlocked, in the shape of the geometry itself.
+        Bot:     RULE "win material", rank 90, same test as Phase — the 8-way
+                 geometry must unlock a safe capture worth >= bar(3).
+
+    --- ECONOMY ---
+
+    Multiply ($2) — Duration: 1 owner turn
+        Effect:  If the piece is captured, the capturer earns the boosted value
+                 (liability); if it captures, IT earns the boosted value (offense).
+                 Both apply; victim-mod has priority (Section 1).
+        Visual:  Green tint (0.2, 0.85, 0.2).
+        FX brief [DESIGN]: a slow gold shimmer sweep for the duration. On PAYOUT,
+                 coins physically fly from the captured square to the owner's bank
+                 label, which then punches up. The payoff beat is the whole point of
+                 an Economy power-up and it currently has none.
+        Bot:     RULE "multiply", rank 70. Fires when the planned move ALREADY
+                 captures. Gated by Rule A on the EXTRA gold earned, not the victim's
+                 raw value — _multiply_reward pays $4 for a Multiplied pawn capture
+                 against $1, so even a pawn nets +$3 on a $2 slot and the old
+                 "victim worth 3+" bar was simply wrong.
+                 AND gated on LIABILITY: the buff survives the opponent's reply and
+                 _capture_payout reads the victim's modifier first, so a Multiplied
+                 piece that dies pays the opponent double. Only ever applied to a
+                 capturer that is safe where it lands. See 8.4.
+
+    Negate ($4) — Duration: 1 owner turn
+        Effect:  If the piece is captured this turn, the attacker earns $0.
+        Visual:  Red tint (0.9, 0.2, 0.2).
+        FX brief [DESIGN]: red RGB-channel glitch/static for the duration. On payoff,
+                 a big red "$0" punches up from the square while the opponent's gold
+                 label SHAKES BUT DOES NOT MOVE. That is the joke landing, and it is
+                 the clearest possible teaching moment for the rule.
+        Bot:     RULE "negate", rank 40 — the rule the Aug 26 rewrite exists for.
+                 Negate does NOT save the piece; it only denies the payout when the
+                 piece dies. So it needs all three: the piece is genuinely hanging,
+                 nothing higher-ranked is already saving it, and Rule A passes —
+                 the denied payout must EXCEED Negate's own $4. With P1 N3 B3 R5 Q9
+                 that means ROOK OR QUEEN ONLY, NEVER A PAWN, at any aggression.
+                 Still skipped if the move gives check (the opponent must answer it
+                 and the capture never happens).
+
+    --- UBER ---
+
+    Cheat ($15) — Duration: Instant (slot freed on use)
+        Effect:  Two-click flow. Click an enemy (non-King) piece, then a destination
+                 from its normal geometry (get_cheat_moves). The piece slides there
+                 (animated); if occupied, the occupant is captured for no gold. The
+                 relocated piece is cheat_protected_square — the cheater may not
+                 capture it for the rest of the turn. Does NOT end the turn.
+        Visual:  Animated slide (_slide_piece tween) — IDENTICAL to a normal move.
+        FX brief [DESIGN]: THE BIGGEST VISUAL GAP IN THE GAME. The signature $15 Uber
+                 power-up currently looks exactly like moving a pawn. It should look
+                 like theft: full-screen desaturation, marionette strings or a red
+                 silhouette hand on the puppeted piece, and a drag across the board on
+                 DELIBERATELY JERKY, NON-SINE EASING. Every other animation in the
+                 project eases in-out; Cheat is the one that should move WRONG. Board
+                 snaps back to color on release.
+        Bot:     RULE "cheat", rank 30. Resolved BEFORE the deep search, since it
+                 reshapes the board everything else is planned against. Requires an
+                 enemy threatening something worth >= bar(5), and prefers dragging it
+                 to an empty square the bot already covers.
+                 HARD GUARD: if every legal destination is OCCUPIED, the bot HOLDS the
+                 Cheat. get_cheat_moves does not exclude the cheater's own pieces and
+                 execute_cheat_move captures the occupant for no gold, so "take any
+                 destination" could spend $15 to delete the bot's own queen — and the
+                 search cannot catch it, because the relocation is already committed
+                 to board_state before best_move runs.
+                 Slice 2 (fold Cheat into the search) is CLOSED, not open: see 8.
+
+3.2 TAP-IN  (replaces Revive)                                            [BUILT]
+
+    AS BUILT — the three open questions at the foot of this section are closed:
+        - SUB BUDGET: 3 per side per match, flat. game.gd SUBS_PER_MATCH, no mode
+          dial. Reset by _do_rematch alongside the bench.
+        - CONSTANTS: SUB_FEE = $1, VALUE_COEF = $2, exactly as proposed. Both live at
+          the top of game.gd next to tapin_cost().
+        - RE-ELIGIBILITY: yes — a piece tapped out is bench-eligible again with no
+          extra flag. The sub budget is the only limiter, as designed.
+        - A piece that has already been tapped in once carries no marker of any kind.
+          is_revived is gone from the piece dictionary entirely.
+    Still outstanding: the FX BRIEF below (the bench-to-board crossing), which waits
+    on fx.gd landing in Section 6.
+
+    THE PITCH
+        The captured tray stops being a graveyard and becomes THE BENCH. You no
+        longer resurrect a dead piece onto an empty home square — you SUBSTITUTE:
+        a benched piece comes on, and the piece it replaces comes off. Same square,
+        straight swap, like a manager tapping a sub in.
+
+        This is a rename with teeth. "Revive" is necromancy sitting inside a game
+        that is otherwise entirely about money, rosters, and buying advantage. A
+        bench fits the shop, the gold, and the Über branding, and it converts an
+        unbounded resurrection loop into a bounded, legible roster decision.
+
+    THE RULE
+        Tap-in is a TERMINAL action: it ends your turn, exactly as Revive did. It
+        shares the Uber class with Cheat, so one Uber action per turn, and it is
+        driven from the gutter, not from a slot.
+
+        1. Click a piece on your bench.
+        2. Click one of YOUR pieces on the board.
+        3. They swap. The bench piece takes that exact square. The board piece
+           goes to your bench, where it can be tapped back in later.
+        4. Gold is charged, one sub is spent from the match budget, turn ends.
+
+    WHERE THE OUTGOING PIECE GOES — YOUR OWN BENCH, REUSABLE
+        The piece taken off is NOT captured. The opponent earns no gold and it does
+        not enter their tray. It sits on your bench and is eligible to come back on
+        a later tap-in. This is what makes the mechanic a rotation rather than a
+        one-shot, and it is what enables the play the whole design is built around:
+
+        THE RESCUE. Your Queen is trapped, pinned, or simply lost next move. You tap
+        a Pawn in for her and she walks off to the bench. You have converted a LOST
+        queen into a BENCHED queen for the price of a pawn's presence and a tempo.
+        Getting her back on later costs real money (see the formula) — so the rescue
+        is cheap, the reinstatement is expensive, and that asymmetry is the entire
+        economy of the mechanic. It is emergent from one rule, not bolted on.
+
+    COST FORMULA — one line, replaces the flat revive_cost table
+        cost = SUB_FEE + max(0, value_in − value_out) * VALUE_COEF
+        Proposed: SUB_FEE = $1, VALUE_COEF = $2.
+
+        Worked examples:
+            Queen in for a Pawn        (9−1)*2 + 1 = $17   (upgrade — expensive)
+            Rook in for a Knight       (5−3)*2 + 1 = $5
+            Knight in for a Bishop     (3−3)*2 + 1 = $1    (lateral — nearly free)
+            Pawn in for a Queen        (1−9)→0  + 1 = $1    (THE RESCUE — cheap)
+
+        The old table charged Queen=$18 / Rook=$10 / minor=$6 / Pawn=$4 regardless
+        of context. The formula lands in the same neighbourhood for the upgrade case
+        while making lateral rotation and rescue affordable, and it deletes the
+        revive_cost dict entirely. Both constants are tuning dials — SUB_FEE keeps
+        lateral swaps from being literally free, VALUE_COEF is the upgrade brake.
+
+    THE LIMITER — A SUB BUDGET PER MATCH
+        Each side gets a fixed number of tap-ins per game. Proposed: THREE.
+
+        This replaces the is_revived flag outright. A hidden per-piece boolean is
+        unteachable; a sub counter is a scoreboard. It renders in the gutter under
+        the bank as:
+
+            SUBS  ● ● ○
+
+        It is authentically sport — a manager gets a fixed number of substitutions
+        and every one is a decision with a visible cost — and it stacks cleanly with
+        the two brakes already present (Uber class = one per turn, tap-in ends the
+        turn). Three subs, each costing a full tempo, is a tight budget: rotating for
+        a marginal gain is simply never worth it, which is exactly the intent.
+
+        The count is per SIDE, per MATCH, reset by _do_rematch alongside everything
+        else.
+
+    ELIGIBILITY & EDGE CASES
+        - The King may never be tapped in or out. (It cannot reach the bench anyway.)
+        - The incoming piece arrives PLAIN: modifier "", modifier_duration 0, and
+          has_moved = TRUE. The has_moved flag is not cosmetic — tapping onto a
+          Rook's home square must not resurrect castling rights.
+        - A GROUNDED piece cannot be tapped out. It is immobilised for the duration;
+          thematically it is locked onto the field. This gives Ground a genuine second
+          use and is the only power-up that interacts with Tap-in directly.
+        - The outgoing piece SHEDS its modifier when it reaches the bench. Buffs are
+          per-piece-per-turn; they do not ride the bench.
+        - A Super Pawn keeps is_super_pawn across the cycle (see 3.1).
+        - A Pawn may not be tapped onto its own promotion rank. (Landing on the far
+          rank mid-turn with no picker flow is a soft-lock; blocking it is cheaper
+          than special-casing promotion into a terminal action.)
+        - The swap is REJECTED if it would leave your own King in check — same
+          tentative-place-and-verify pattern _do_revive already uses.
+        - The bench is your OWN fallen pieces. Note that game.gd's captured_pieces
+          comment currently reads "Pieces each side has captured", which is WRONG:
+          line 435 appends under the VICTIM's color, so captured_pieces["White"] is
+          White's losses. Renaming the var to `bench` fixes the code and the comment
+          in one move.
+
+    WHY IT IS ALSO SIMPLER THAN REVIVE
+        Revive forces placement onto an EMPTY STARTING SQUARE of the matching type.
+        That produces a real dead end in game.gd ("Cannot revive: all of its starting
+        squares are occupied"), a candidate-square list in revive_pending, a
+        highlight pass in update_visuals, and a whole safety probe in the bot
+        (_safe_revive_tile). Tap-in places the piece exactly where the outgoing one
+        stood: always a legal square, no candidate hunting, no failure path. The
+        change is a net DELETION of code.
+
+    UI FLOW                                                              [BUILT]
+        The whole bench glows cyan while tap-in is armed (tapin_selecting, or a
+        tapin_pending waiting for its target); the armed piece itself wears the
+        selection gold. On picking a bench piece, your own board pieces that are
+        legal swap targets highlight, and the turn indicator reads
+        "Tap in [Type] — pick a piece". Right-click, re-clicking the bench piece, the
+        Tap-In shop button, or clicking any non-target square all cancel.
+
+        THE PRICE RIDES THE TARGET, NOT THE BENCH ICON. Cost depends on who comes
+        OFF, so a benched Queen is $1 over a Rook and $17 over a Pawn — a single
+        number on her bench icon would be a lie whichever number it was. Each
+        highlighted target square therefore carries its own "$N" tag, drawn above the
+        sprite. The bench icons say only "these are live".
+
+        game._tapin_targets() is the SINGLE source of truth for what is a legal,
+        affordable swap: the arm step, the highlight pass, the commit, the network
+        replay and the bot's rule all call it. Nothing re-derives the eligibility
+        rules, so they cannot drift apart.
+
+    FX BRIEF [DESIGN]
+        The best animation opportunity the mechanic creates. Revive spawned a piece
+        out of nowhere; Tap-in has a real physical journey in BOTH directions. The
+        bench piece travels from its tray slot in the left gutter onto the board while
+        the outgoing piece travels back out to the gutter — a visible crossing. Sub
+        counter ticks down with a stamp.
+
+    RENAMES THIS IMPLIES
+        captured_pieces      → bench
+        revive_pending       → tapin_pending
+        revive_selecting     → tapin_selecting
+        _do_revive           → _do_tapin
+        _bot_revive          → _bot_tapin
+        piece_rules.revive_cost → (deleted; see the formula)
+        is_revived           → (deleted; see the sub budget)
+        shop item "Revive"   → "Tap-In"  (powerup_classes/powerup_costs entries)
+        wire type "REVIVE"   → "TAP_IN"  (Section 11 — protocol change)
+
+    OPEN QUESTIONS
+        - Does a bench piece that has already been tapped in once, then tapped back
+          out, still count as bench-eligible? (Assume yes; the sub budget is the
+          limiter and a second limiter would be redundant.)
+        - Should the sub budget be a difficulty/mode dial (3 local, 5 online)?
+        - Does spending your last sub deserve a UI moment? Probably yes — it is the
+          only irreversible resource in the game.
+
+================================================================================
+4. ENGINE PHYSICS                                                        [BUILT]
+================================================================================
+
+    Piece data: per-piece dictionaries in board_state, keyed by Vector2 grid coord.
+    Each entry: type, color, has_moved, modifier, modifier_duration, is_super_pawn.
+    (is_revived was removed with Revive — see 3.2. It is not written by
+    initialize_board, by a tap-in, or by anything else.)
+
+    Visual modifiers: sprite.modulate tints for Ground/Phase/Teleport/Multiply/
+    Negate/Capture (MOD_TINTS). Shield uses the bubble overlay instead of a tint.
+    [DESIGN] MOD_TINTS is superseded by the shader-driven state layer in Section 6.3
+    and moves into the theme (Section 7) so effect colors can be tuned per board.
+
+    Movement & rules:
+        Castling:  has_moved tracking + safe-passage check; King and Rook slide on
+                   parallel tweens.
+        En passant: transient en_passant_target ghost coord, cleared on every
+                   non-double-pawn move.
+        Threat detection: is_in_check() and get_safe_moves() (timeline simulation),
+                   recursion-safe. Agility modifiers (Phase/Teleport) are ignored
+                   during threat scans (checking_threats=true) so check/checkmate
+                   always use normal geometry.
+        Full geometries for all six types, including the Super Pawn hybrid.
+        Promotion: interactive picker (_show_promotion_menu) — a CanvasLayer overlay
+                   of TextureButton icons in the promoting player's art.
+                   execute_move() awaits promotion_chosen. Super Pawns and bot moves
+                   auto-promote to Queen.
+
+    End-of-game — two win paths coexist:
+        (1) KING CAPTURE (primitive): a real move landing on the enemy King wins
+            instantly. get_safe_moves returns a King capture as an unconditionally
+            legal winning move, bypassing self-check simulation (so it wins even out
+            of check — first to take a King wins, resolving mutual-check for the side
+            to move). execute_move intercepts a captured King → game_over,
+            won_by_king_capture, winner = mover; no gold, no bench entry, no
+            promotion, no turn swap. Banner: "<winner> captures the King!". Reset in
+            _do_rematch.
+        (2) CHECKMATE / STALEMATE (legacy fallback): unified via has_legal_moves() in
+            _finish_turn — no legal moves + in check = Checkmate; no legal moves while
+            safe = Stalemate. Kept so a mated side never soft-locks. Slice 2 (sudden
+            death) will replace instant checkmate with a forced King capture via path (1).
+        Because threat scans use normal geometry, path (1) is DORMANT in normal play
+        (no side can be left with a capturable King), making the rework regression-free.
+        It goes live with Uber-check (Slice 3).
+
+    Power-up expiry:
+        expire_modifiers(color): decrements modifier_duration on that color's pieces;
+            at 0, modifier and duration clear (tint resets next spawn_visual_pieces()).
+            Called as control RETURNS to the player, so a buff applied on turn N
+            survives the reply and expires at the start of turn N+1. Duration -1 =
+            permanent (supported, unused).
+        One-shot buffs: Phase, Teleport, Capture are consumed at the acting player's
+            turn end (_finish_turn) whether or not used.
+
+    Animation (current):
+        _slide_piece(): ghost node tweened source→dest over 0.22s (sine in-out). Used
+            by execute_move, castling rook, and Cheat.
+        _hide_piece_at(): hides the static board node by exact board_pos meta match.
+        Captured fade: independent 0.15s alpha tween on the victim.
+        is_animating: blocks board input while a tween runs.
+        [DESIGN] Section 6 replaces the ad-hoc animation code in game.gd with an
+            fx.gd module. _slide_piece stays (it is correct and reusable); everything
+            power-up-shaped moves out.
+
+================================================================================
+5. VISUAL FEEDBACK & UI                                                  [BUILT]
+================================================================================
+
+    Move indicators: green dots on empty targets, red rings on capturable enemies,
+        from get_safe_moves() (so they respect pins/check). Cheat mode shows the
+        puppeted piece's raw geometry. All overlays are in group "dynamic_overlay",
+        cleared each redraw.
+
+    Turn indicator: TurnIndicator Label — "WHITE'S/BLACK'S TURN", "… — Check!" (red),
+        "Checkmate! [Winner] wins!" (gold), "<winner> captures the King!" (gold),
+        "Stalemate — Draw!" (gray), "Tap in [Type] — pick a piece" (cyan).
+
+    Bot action banner: BotActionBanner Label announces each bot power-up action in
+        orange (e.g. "🤖 Used Shield on its Rook"), auto-fades ~2s.
+
+    Board coordinates: files a–h across the bottom, ranks 1–8 down the left
+        (a1 = White's bottom-left), static Labels in draw_coordinates().
+
+    Left gutter: two non-overlapping vertical bands (Black above, White below). Each
+        stacks Bank label → Power-Up Slots heading → 3 slot buttons → Bench heading
+        → bench-piece icon grid. Slot colors: gray=locked, green=ready, gold=held.
+        Bench icons are clickable TextureButtons that start the tap-in flow.
+        A SUBS row sits under the bank label (see 3.2), drawn by _draw_subs_meter:
+        the word SUBS plus SUBS_PER_MATCH pips, gold for remaining and dark for
+        spent, in an HBoxContainer so nothing depends on the font's rendered width.
+        Pips are ColorRects, not ●/○ glyphs — Poxast has no reliable circle.
+
+    Shop: static right-side UI. Affordability colors update live: bright green=can buy,
+        dim red-gray=blocked, cyan=Tap-In (dynamic), gold=item currently in hand.
+
+    Input lock: game_over and is_animating disable board input during end-of-game and
+        slide tweens.
+
+    Board appearance: 8×8 rainbow-hued (draw_board()). Hue sweeps the 15 diagonals
+        (x+y = 0..14) corner-to-corner; the light/dark checker is preserved through
+        VALUE only, so the grid reads clearly under the 3D piece art. Light squares
+        HSV(hue,0.40,0.95), dark HSV(hue,0.65,0.52).
+        [DESIGN] This becomes ONE THEME rather than the hardcoded default — see
+        Section 7. The rainbow is a bold choice and deserves to be a choice.
+
+    Background: full-window stone backdrop BG_COLOR (0.16,0.16,0.21), z_index -100,
+        mouse-ignored.
+
+    Typography: all in-game UI text renders in Poxast (same display font as the menu
+        "ÜBERCHESS" wordmark), loaded in _load_ui_fonts() with antialiasing / hinting
+        / subpixel disabled for crisp pixels. Merchant Copy is chained as a per-glyph
+        fallback. The turn banner uses the 3D-Thirteen accent font. Fonts apply via
+        per-node overrides plus a node_added hook, so dynamically created text (shop,
+        bench, slots, promotion picker, lobby) inherits them. A single UI_FONT_SCALE
+        constant multiplies every text node's size at apply time, so overall in-game
+        text size is one dial. Missing font files degrade to default.
+        [DESIGN] The font PATHS move into the theme (Section 7); the loader itself
+        already takes paths and needs no restructuring.
+
+================================================================================
+6. EFFECTS & ANIMATION SYSTEM (fx.gd)                                  [PARTIAL]
+
+    STATUS: the MODULE exists and one effect runs through it (6.7, the check alert).
+    The shader layer, the generic cast, and the whole payoff channel are still
+    [DESIGN]. See 6.6 for what is ticked.
+================================================================================
+
+    THE PROBLEM, STATED PRECISELY
+        Every power-up in the game is `sprite.modulate = <color>` and nothing else.
+        A tint is the weakest signal available: it is static, it is ambiguous (which
+        tint was Negate?), it fights the 3D piece art it is painted over, and — worst
+        — it does nothing at the MOMENT of application, which is the moment that
+        should feel like something.
+
+        Everything is PNGs and JPEGs stacked on each other. Godot can do far more,
+        and none of what follows requires new art.
+
+6.1 THREE PROBLEMS, NOT ONE
+
+    These need different solutions and should be tracked separately:
+
+    (a) THE CAST — the instant the power-up is applied.
+        Currently: nothing at all. This is where the juice goes.
+
+    (b) THE STATE — "this piece is Shielded RIGHT NOW."
+        Currently: a tint. Must be readable at a glance across 32 pieces without
+        fighting the art. This is what the shader layer replaces.
+
+    (c) THE PAYOFF — the moment the buff actually DOES something. A Shield blocks a
+        capture; Negate zeroes the income; Multiply pays out; Ground refuses a
+        capture. Currently: completely invisible, at every single one of them.
+        This is the most under-served of the three and the most valuable to fix,
+        because the payoff beat is where the player LEARNS THE RULE.
+
+6.2 THE MODULE                                                           [BUILT]
+
+    A single fx.gd / FXPlayer with one public entry point:
+
+        fx.play(effect_name: String, board_pos: Vector2, opts := {}) -> void
+        await fx.play_awaited(...)   # for beats that must gate the turn
+
+    Effects live as scenes in res://fx/ — one .tscn per effect. game.gd is already
+    2,839 lines; animation code must not grow inside it. game.gd calls fx.play() and
+    knows nothing about particles, shaders, or tweens.
+
+    All effect colors come from the active theme (Section 7), never from constants
+    in fx.gd. A brown Ground that reads on the rainbow board and vanishes on a walnut
+    board is a silently broken feedback system.
+
+    AS BUILT
+        fx.gd is `class_name FXPlayer extends Node2D`, created in game._ready() as the
+        child "FX" with z_index 4 — above the board and pieces, below the Shield
+        bubbles (z 5) so a shielded king in check still reads as shielded first.
+        game.gd holds it as `var fx` and calls it ONLY through two guarded helpers,
+        _fx_play() and _fx_sync_check(), so the null check lives in one place and a
+        missing fx.gd degrades to the old silent game instead of taking a match down.
+
+        fx asks game.gd for exactly two things — _square_center() and
+        _piece_node_at() — and game.gd asks fx for nothing. Keep that one-way.
+
+        The palette is a dict on the module with a set_palette() hook. Section 7 takes
+        it over wholesale; nothing in fx.gd hardcodes a colour at a call site.
+
+        GameConfig.fx_mode (FULL / REDUCED / OFF) is read once in fx._ready(). REDUCED
+        keeps the state layer and scales cast durations to 0.3 rather than skipping
+        them — a beat that vanishes entirely teaches the player nothing.
+
+    THE REDRAW TRAP, which every future effect has to respect
+        game.update_visuals() frees and rebuilds every piece node on each redraw (any
+        child with a Sprite2D, named Piece*, or in dynamic_overlay). So:
+          - PERSISTENT state must be drawn by the FX node itself, not parented to a
+            piece, or it evaporates at the next repaint. Drawing it in fx's own
+            _draw() and looking the square up fresh each frame also makes it follow a
+            moving piece and survive a board flip for free.
+          - A tween that animates a piece must be created FROM that piece
+            (piece.create_tween()), so it dies with the node instead of writing to a
+            freed object mid-animation.
+
+6.3 THE GODOT TOOLBOX, RANKED BY PAYOFF PER HOUR
+
+    1. SHADERS ON THE PIECE SPRITE — replaces modulate outright.
+       ONE canvas_item shader with a `mode` uniform covers every state:
+           shield   → animated fresnel rim + slow vertical bob
+           ground   → desaturate, heavy dark base, zero movement
+           phase    → ghosting / scanline + alpha shimmer
+           teleport → edge instability
+           negate   → RGB channel-offset glitch
+           multiply → slow gold shimmer sweep
+           capture  → pulsing hot outline
+       All TIME-driven, one file, applied per-piece via set_shader_parameter.
+       The menu's board-backdrop shader in main_menu.gd already proves the pipeline.
+
+       HIGHEST-VALUE SINGLE EFFECT: a colored OUTLINE / RIM. It reads at any size,
+       against any board, over any art — which a tint never will. If only one thing
+       gets built from this section, build the outline shader.
+
+    2. GPUParticles2D — for the cast.
+       One .tscn per effect, one_shot = true, emitting = true, instantiated at the
+       target square, queue_free on `finished`. Needs no art beyond a white dot you
+       tint per effect and per theme. Cheapest dramatic win available.
+
+    3. TWEENS — for weight.
+       Squash/stretch on the target at application (scale to ~1.15 and back,
+       TRANS_ELASTIC / EASE_OUT), a screen flash, a short board shake for the Uber
+       class. _slide_piece already shows Tween is well understood here. Roughly
+       fifteen lines gives every power-up a physical thunk.
+
+    4. AnimationPlayer + a dedicated scene — for the ones that deserve choreography.
+       Cheat, Teleport, Super Pawn, Tap-in. These have multiple beats that must be
+       sequenced, not just fired.
+
+    5. CanvasLayer full-screen effects — RESERVED FOR THE UBER CLASS.
+       Vignette + chromatic aberration + desaturation pulse when Cheat fires.
+       Restraint is the point: if everything gets a screen effect, nothing is special.
+
+    6. Light2D / CanvasModulate — the board dims, the affected square lights.
+       A cheap and very strong two-second beat.
+
+6.4 PAYOFF BEATS (problem (c) — currently zero coverage)
+
+    Shield blocks a capture   → bubble flashes and SHATTERS
+    Ground refuses a capture  → attacker recoils, dust puff, dull impact
+    Multiply pays out         → coins fly from the square to the bank label, which
+                                punches up
+    Negate pays out           → red "$0" punches up; opponent's bank label SHAKES
+                                but does not increment
+    Check income (+$2)        → a small coin arc, same channel as above
+    King capture              → the finisher; see win-condition Slice 2 (Section 13)
+
+    Gold changing silently is the single largest missed satisfaction beat in the
+    game. Coins travelling to a counter is a proven loop and the whole channel is
+    one reusable effect parameterised by start square, end label, and count.
+
+6.5 THE TIMING BUDGET — A HARD CONSTRAINT                                [BUILT]
+
+    THE BOT'S TURN IS A FIXED 4 SECONDS. Not a pause plus some gaps that add up to
+    however long they add up to — a hard wall-clock budget, from the moment your move
+    ends to the moment the bot's turn-ending action fires, identical whether its plan
+    holds one action or three. The old scheme (a 1.6s think pause plus 1.5s after each
+    power-up use) meant a plain move took 1.6s and a three-action turn took 5s+, and
+    the length of the bot's turn leaked its plan before you saw it.
+
+    HOW IT WORKS (game.gd _maybe_let_bot_move):
+        - GameConfig.BOT_TURN_SECONDS (4.0) is the authority. game.gd reads it for
+          pacing; UberbotStrategy reads bot_plan_budget_ms() to size its veto pass.
+          One number, two consumers, no drift.
+        - plan_turn() runs UP FRONT, so the blocking search is spent FROM the budget
+          rather than added on top. A slow think shortens the pause, it does not
+          lengthen the turn.
+        - The turn-ending action is anchored to the 4.0s mark. Any actions before it
+          are spread evenly across whatever time is LEFT after planning, counting
+          backwards from the deadline. Beats stay visibly separated at every
+          difficulty instead of two landing in the same frame.
+        - _wait_until() takes an ABSOLUTE deadline, never a sleep. An action whose
+          animation runs long eats into the next gap rather than pushing the whole
+          turn out.
+
+    WORST-CASE SCHEDULE (ms from the start of the bot's turn). think_ms is a CAP, not a
+    cost — iterative deepening often finishes under it and the veto pass exits early once
+    proposals run out, so real beats land EARLIER than this, never later:
+                    1 action    2 actions        3 actions
+        Easy          4000      2575/4000        2100/3050/4000
+        Normal        4000      2850/4000        2467/3233/4000
+        Hard          4000      3350/4000        3133/3567/4000
+        Über          4000      3650/4000        3533/3767/4000
+
+    THE FX CONSTRAINT IS UNCHANGED, AND NOW TIGHTER:
+
+        Cast beat:    <= 0.5s   (Super Pawn is the deliberate exception, ~1.2s)
+        Payoff beat:  <= 0.4s
+        Uber cast:    <= 0.8s
+
+    OVERLAP THESE WITH THE GAPS ALREADY BEING PAID. Do not add to them — and note that
+    unlike the old fixed 1.5s gap, THE GAP IS NOW VARIABLE. At Über with three actions
+    it is 233ms, under the 0.5s cast budget. FX must therefore be interruptible or
+    scale to the gap they are given, not assume a fixed slot. If a three-action Über
+    turn reads as rushed once FX land, the lever is GameConfig.BOT_PACING_RESERVE_MS
+    (raise it from 700) or Über's think_ms (lower it) — NOT a longer turn, which
+    breaks the one property this whole system exists to provide.
+
+    Ship an FX SPEED setting (Full / Reduced / Off) in Options from day one, not as
+    a later accessibility bolt-on. Reduced should keep the state layer (b) and cut
+    cast/payoff to near-instant.
+
+6.7 THE CHECK ALERT                                                      [BUILT]
+
+    NOT IN THE ORIGINAL SECTION 6, and its absence was the gap. Every effect listed
+    above decorates a POWER-UP. Check is the one moment of ordinary chess that the
+    game already computes, already pays $2 for, and communicated only as four words of
+    small red text in the turn banner — the most important thing that can happen to
+    you, with the least presentation in the game.
+
+    A LOUD HIT, THEN A QUIET HOLD. Check is not an event, it is a STATE, and the two
+    need different treatment:
+        CAST (~0.45s, inside the 0.5s budget): two red rings punch outward from the
+            king's square, staggered ~90ms, while the king itself shakes on a decaying
+            4-oscillation wobble with a scale punch (TRANS_BACK out, TRANS_ELASTIC
+            back). Fire-and-forget — it never gates a turn, so the bot's 4s wall clock
+            is untouched.
+        HOLD (as long as check persists): a soft interior wash plus a hard rim arc
+            around the king, breathing at ~0.9 Hz. Slow on purpose — fast reads as an
+            alarm, and this needs to read as a condition.
+
+    WHY THE HOLD EXISTS AT ALL: a one-shot is invisible to a player who glanced away,
+    and being in check is precisely the state you must never lose track of. The cast
+    says "it just happened"; the hold says "it is STILL happening".
+
+    NO SCREEN-SPACE EFFECT, deliberately. 6.3 reserves full-screen treatment for the
+    Uber class; spending a vignette on check would flatten the one beat that is
+    supposed to feel bigger than everything else.
+
+    WIRING. game._finish_turn() sets a local `check_delivered` when it newly detects
+    check, and fires the cast AFTER its update_visuals() — firing before would animate
+    a piece node the redraw is about to free. _fx_sync_check() then reconciles the
+    persistent marker on every turn swap, and is called again from the king-capture
+    branch (which sets game_over and so never reaches _finish_turn's body), from
+    _apply_resignation, and from _do_rematch. A red ring still pulsing after the match
+    ends reads as a bug, not a state.
+
+6.8 PIECE-CHARACTER MOVEMENT — THE KNIGHT LEAP                           [BUILT]
+
+    A CATEGORY SECTION 6 DID NOT HAVE. Everything above animates a POWER-UP. This is
+    about the pieces' own moves: every piece currently travels through the identical
+    _slide_piece tween, and for one piece that is not merely bland, it is WRONG. The
+    knight is the only piece in chess that jumps over things, and gliding it flatly
+    between squares contradicts the single rule that defines it.
+
+    THE LEAP
+        Flight (0.40s): a parabolic arc peaking at 1.15 tiles, with TWO full front
+            flips. Horizontal speed and angular speed are both LINEAR — that is what
+            a real tumble does; all the arc lives in the height term. Spin follows
+            travel (clockwise moving right) so it reads as tumbling FORWARD rather
+            than spinning in place.
+        Ground shadow: an ellipse tracks the knight's ground position, shrinking and
+            fading as it rises. Without it the arc reads as "drifting up the screen"
+            instead of "leaving the board". Cheapest possible sell of height.
+        Crash (0.20s): squash to 1.30 x 0.66 and elastic back, with the piece dipping
+            7% of a tile so the squash reads as weight driving INTO the square — the
+            sprite is centre-origin, so scaling alone would lift its feet instead.
+            A flattened dust ring expands from the base and six specks fan outward
+            under gravity.
+
+    THE VICTIM IS CRUSHED ON IMPACT, NOT BEFORE. execute_move fades a captured piece
+        over 0.15s the instant the move starts, which for a 0.40s flight meant the
+        target dissolved while the knight was still airborne and the landing came
+        down on an empty square — losing the one frame the whole animation exists
+        for. The fade now waits fx.travel_time("knight_leap") first.
+
+    COST: 0.60s against a slide's 0.22s. Paid on the bot's TERMINAL action, which is
+        anchored at the 4s deadline and whose animation has always run past it, so
+        the turn budget in 6.5 is unaffected. Do not let it grow much past 0.6s.
+
+    WIRING: the dispatch lives in _slide_piece, not execute_move, so a Cheat-puppeted
+        knight leaps too — it is how knights move, not a property of whose turn it is.
+        _slide_piece grew an optional `piece_type` argument; pass it at every call
+        site. This is the seam every other piece-character animation hangs off.
+
+    OPEN: the other five pieces still share the generic slide. Candidates, in rough
+        order of how much the move would say — Rook: a fast, straight, heavy slam with
+        no easing in. Bishop: a smooth glide that leaves a diagonal trail. Queen:
+        borrows whichever of the two matches her direction. Pawn: a small determined
+        step. King: slow, with weight. None are built and none are urgent.
+
+6.6 BUILD ORDER WITHIN THE SECTION
+
+    1. fx.gd skeleton [DONE] + the outline/rim shader [OPEN] (state for all 7 buffs)
+    2. Generic cast: particle burst + squash/stretch, wired to every power-up
+    3. The payoff channel (6.4) — coins, shatter, $0 punch
+    4. Bespoke choreography: Cheat, Teleport, Super Pawn
+    5. Tap-in's bench-to-board crossing (after Section 3.2 lands)
+    6. Options FX-speed dial + timing pass against the bot's turn
+
+================================================================================
+7. THEMES                                                               [DESIGN]
+================================================================================
+
+    GOAL
+        The player picks a preset that changes fonts, piece art, board colors, and
+        the FX palette together. Not a color picker — a PLACE. Each theme should feel
+        like somewhere the game is being played.
+
+    ARCHITECTURE
+
+        ChessTheme extends Resource         — exported fields, saved as .tres
+            font_ui_path, font_accent_path, font_fallback_path
+            piece_art_dir                   (e.g. "res://assets/pieces/default/")
+            board_mode                      (PROCEDURAL_RAINBOW | TWO_COLOR | TEXTURE)
+            board_light, board_dark, board_accent
+            bg_color, panel_color
+            fx_colors : Dictionary          (per power-up; supersedes MOD_TINTS)
+            indicator_move, indicator_capture
+
+        ThemeManager (autoload, beside GameConfig)
+            current : ChessTheme
+            square_color(x, y) -> Color
+            piece_path(color, type) -> String
+            apply()                         — re-fonts, redraws board, respawns pieces
+            signal theme_changed
+
+    THE HOOKS ALREADY EXIST — this is a small change, mostly indirection:
+        - Piece art: "res://assets/pieces/" is hardcoded at ~4 call sites
+          (spawn_visual_pieces, bench tray icons, promotion picker, _slide_piece
+          ghost). All become ThemeManager.piece_path(color, type).
+        - Board: draw_board()'s inline HSV rainbow becomes
+          ThemeManager.square_color(x, y). The rainbow ships as the DEFAULT theme,
+          not as the only board.
+        - Fonts: _load_ui_fonts() already takes paths. Feed them from the theme.
+        - FX: Section 6 reads fx_colors. MOD_TINTS is deleted.
+
+    PERSISTENCE — a separate lifetime from GameConfig
+        GameConfig is per-MATCH and is rewritten by the menu every time a game starts.
+        Theme is per-INSTALL and must survive quitting the app. Store it with
+        ConfigFile in user://uberchess.cfg, loaded by ThemeManager on autoload init.
+        Do not put the theme in GameConfig; it will get clobbered on the next match.
+
+    THE COST TRAP — READ THIS BEFORE SCOPING
+        Board colors and fonts cost minutes. PIECE ART COSTS WEEKS. A full set is
+        12 sprites plus the Super Pawn, times 2 colors = 26 assets per theme.
+
+        So: the first wave of themes SHARES ONE PIECE SET and varies board, fonts,
+        background, and FX palette only. Art sets get added later, individually, as
+        a theme's optional upgrade. Otherwise Themes blocks on art indefinitely and
+        never ships. piece_art_dir falling back to the default directory when a
+        theme's own directory is absent makes this graceful by construction.
+
+    PROPOSED FIRST WAVE (shared art, varied everything else)
+        RAINBOW    — the current board. Default. Poxast. The house style.
+        NOIR       — high-contrast black/white board, deep shadow, hard FX colors.
+        NEON       — the Über brand: dark field, cyan/magenta, glow-heavy FX.
+        CATHEDRAL  — stone greys and stained-glass accents, warm FX.
+        TERRACOTTA — classic wood and clay; the "just let me play chess" theme.
+
+    A theme must be validated against the FX palette, not just the board: run every
+    power-up state on every theme and confirm all seven are distinguishable from each
+    other AND from the unbuffed piece. That check belongs in the Options preview.
+
+================================================================================
+8. BOT SYSTEM — ÜBERBOT
+   (uber_bot.gd + UberbotStrategy.gd + UberbotPowerupPolicy.gd + UberbotOpenings.gd)
+================================================================================
+
+    STATUS: [FROZEN] on STRENGTH. Power-up POLICY was reopened and rewritten (Aug 26).
+
+    THE DECISION AND WHY
+        The bot is the most finished system in the project and the least visible one.
+        No player at Normal difficulty can perceive the difference between a depth-6
+        and a depth-7 search. Meanwhile the thing every player sees is the bot doing
+        something with a power-up that makes no sense. The bot is where this project
+        could be worked on indefinitely, which is precisely the reason to close it —
+        but "close it" means closing it on STRENGTH, and strength was never the part
+        players could see.
+
+        WHAT REOPENED, AND WHY IT HAD TO
+            Playtest: the bot used a power-up ONCE in an entire game, and that one use
+            was a $4 Negate on a $1 pawn, with a $3 Ground ready in the next slot that
+            would have made the pawn uncapturable outright.
+
+            That is not a search bug and no amount of search tuning would have fixed
+            it. The search speaks CENTIPAWNS. Negate's entire payoff is GOLD DENIAL,
+            which the evaluation cannot represent at all — so Negate never reached the
+            search, and the things that DID reach it were being ranked on a scale that
+            could not price them. The policy was spread across three mechanisms that
+            could not see each other: a search-scored candidate list, a dice-rolled
+            heuristic layer, and a weighted-random shop.
+
+            The fix was to stop asking the search a question it cannot answer. Power-up
+            decisions are now WRITTEN DOWN as rules (8.4). The search's only remaining
+            job in the power-up path is to veto blunders.
+
+        OPEN:      Nothing on strength.
+        DEFERRED:  Slice 3 (combos), Slice 4 (King hunting — blocked on Uber-check
+                   existing at all).
+        LANDED:    The DJ board (8.6) — the aggression dial shipped with the rewrite.
+        CLOSED:    Slice 2 "Cheat into the search". Superseded. Cheat is a RULE now
+                   (8.4), with a value bar and a hard guard against the collateral bug;
+                   folding it into the search would re-import the exact scale mismatch
+                   this revision removed.
+
+8.1 ARCHITECTURE                                                         [BUILT]
+
+    FOUR RefCounted classes. The original seam was per-turn vs per-node; this revision
+    added a second seam inside the per-turn half, between DECIDING and ASSEMBLING.
+
+        UberBot (uber_bot.gd) — the SEARCH ENGINE. Everything per-node: negamax,
+            quiescence, make/unmake, eval + its power-up terms, opponent-PU branching,
+            move ordering, TT/Zobrist, king-safety, and the candidate-turn scorer
+            (score_turn / _apply_turn / _revert_turn). UNCHANGED by the rewrite.
+
+        UberbotPowerupPolicy (UberbotPowerupPolicy.gd) — the RULE BOOK. Every power-up
+            decision: which to use, on what, and what to buy. Nine rules, a hardcoded
+            precedence order, two absolute rules, and the `aggression` dial. This is
+            the file to open when the bot does something with a power-up you don't
+            like; it is written to be read top to bottom.
+
+        UberbotStrategy (UberbotStrategy.gd) — the ASSEMBLER. plan_turn, the opening
+            book path, the Cheat board-swap, and the rules/veto loop that turns the
+            rule book's proposals into an ordered action list. Owns the engine and the
+            policy and drives both. It no longer DECIDES anything about power-ups.
+
+        UberbotOpenings (UberbotOpenings.gd) — the OPENING BOOK. 96 named lines,
+            indexed by position signature rather than move number, so transpositions
+            share entries automatically. 9 first moves as White, up to 10 replies to
+            1.e4 as Black, capped at MAX_BOOK_PLY = 10.
+
+    game.gd _ready() does `bot = UberbotStrategy.new(self)`; its only bot call is
+    bot.plan_turn(bot_color). The seam in one line: THE RULE BOOK DECIDES, THE SEARCH
+    VETOES, THE STRATEGY ASSEMBLES. Every board mutation across any boundary is paired
+    with its restore.
+
+    WHY THE POLICY IS ITS OWN FILE AND NOT A SECTION OF THE STRATEGY
+        Because the failure mode was never a bug in one function — it was that no
+        single place described what the bot was supposed to do with its kit. The rules
+        were distributed across a candidate generator, a scoring gate, a spend-tier
+        table, a dice roll and a shop. Putting them in one readable file is the fix;
+        the file boundary is what stops them dispersing again.
+
+8.2 SEARCH                                                               [BUILT]
+
+    Iterative deepening 1..MAX_DEPTH; a depth aborted mid-way is discarded, so the
+        bot always returns a fully-searched result.
+    Alpha-beta negamax (_negamax), fail-soft. The ROOT uses a full window so every
+        root move gets an exact score — required for honest opening variety.
+    Transposition table + Zobrist (_tt, _hash, _zkeys), key maintained incrementally
+        by _make/_unmake. A piece's signature includes its modifier + super-pawn state,
+        so buffed/Super pieces never collide with plain ones. Cleared per best_move.
+    Quiescence (_quiescence): captures-only until quiet (max QUIESCENCE_CAP = 6 extra
+        plies) — kills horizon-effect blunders.
+    Move ordering: TT best-move first, then captures by MVV-LVA, then killers.
+    Make/unmake (_make/_unmake): mutate board_state in place and perfectly reverse
+        (captures, en passant, castling, promotion, EP trail, Zobrist hash). No board
+        duplication.
+
+    King-capture awareness: the engine mirrors game.gd's primitive so Vs-Bot cannot
+        desync. _safe_moves_fast / _safe_moves generate enemy-King captures, bypassing
+        the king-safety filter. Win/loss is scored by ONE terminal check at the top of
+        _negamax and _quiescence: if the side to move has no King, return
+        -(MATE_SCORE - ply). That single check makes king-capture a real win/loss at
+        every recursion site, including opponent-PU branching, with no edits to those
+        loops. King-captures order first (order = 1e9) since VAL["King"] = 0 would
+        otherwise sort them last. Dormant in normal play; lights up with Uber-check.
+
+8.3 EVALUATION                                                           [BUILT]
+
+    _evaluate: material + position + power-up state + economy, O(1) per piece.
+        Material: standard values (pawn ~ 100 centipawns).
+        Super Pawn premium 850. Shield +120. Ground +60.
+        Position: piece-square tables (_PST / _pst_bonus) per type, White's
+            perspective mirrored for Black. Replaced the old center/pawn-push proxies
+            AND the per-leaf mobility scan (no MOBILITY_WEIGHT term exists).
+        Economy: GOLD_WEIGHT (6.0) × gold lead, with DIMINISHING RETURNS — the first
+            GOLD_WORKING_RESERVE ($15) is worth full value because you need a float on
+            hand to actually use the shop, and every dollar past it is worth only
+            GOLD_EXCESS_SCALE (0.3) as much. Gold value tapers further toward
+            GOLD_LOSING_SCALE (0.25) as a side falls GOLD_DESPERATION_MARGIN (300cp)
+            behind on material, so a losing bot liquidates instead of clutching.
+            Hash-safe: material is a function of the hashed board.
+
+            CORRECTED Aug 26 — the previous revision of this document described a
+            GOLD_HOARD_BONUS paying a flat +40 for sitting on >= a Cheat's price. That
+            constant is GONE, and the doc had the sign of the problem backwards: that
+            bonus REWARDED hoarding whenever the bot wasn't losing, which uber_bot.gd's
+            own comment names as the main reason it never spent. The diminishing-returns
+            model replaced it precisely to invert that pressure.
+
+8.4 TURN PLANNING & POWER-UP POLICY                                      [BUILT]
+    ── REWRITTEN Aug 26. Everything the previous revision described here is gone. ──
+
+    plan_turn returns an ordered action list — [optional cheat] + [power-up uses, <=1
+    per class] + [optional buy] + [move OR revive]. game.gd paces the whole list into
+    a fixed 4-second turn (6.5).
+
+    THE CONTRACT, IN ONE LINE
+        THE RULE BOOK DECIDES. THE SEARCH VETOES. Nothing else.
+
+        A proposal does NOT have to BEAT the plain best move — that inversion is the
+        entire point. The rule book has already decided the use is sensible on grounds
+        the search cannot see; the search's only job is to catch the case where playing
+        it hangs something. A proposal is thrown out only if it scores more than
+        veto_tolerance() centipawns BELOW the plain move.
+
+    WHY NOT JUST SCORE THEM — THE SCALE MISMATCH
+        Two value scales exist in this game and the old system mixed them.
+            GOLD SCALE      P1 N3 B3 R5 Q9, Super Pawn 8. What the shop charges in and
+                            what capture income pays out in.
+            CENTIPAWN SCALE P100 N320 B330 R500 Q900. What the search returns. MATERIAL.
+        Negate's payoff is purely gold, so it has no centipawn value at all and the
+        search literally cannot rank it. Defensive buffs have the opposite problem: a
+        $5 Shield saving a 320cp knight is a bargain that looks like a loss in gold.
+        A single scorer cannot arbitrate between them. Written rules can.
+
+    THE DIAL — ONE NUMBER, 0.0 TO 2.0
+        `aggression` replaces SPEND_TIERS, USE_PROB, the margin constants and every
+        *_MIN_VALUE threshold THAT LIVED ON UberbotStrategy. Each rule states its bar as
+        a piece value AT BASELINE in UberbotPowerupPolicy's own constants block, and
+        divides it by the dial, so a higher dial lowers every bar at once.
+
+        (UberBot.CAPTURE_MIN_VALUE and TELEPORT_MIN_VALUE still exist on the ENGINE, but
+        they are now only used for modelling what the OPPONENT might do. The rule book
+        keeps its own OFFENSE_BASELINE_VALUE / ESCAPE_BASELINE_VALUE so that every bar
+        it uses is visible in one block. The two sets are independent by design and do
+        not have to agree.)
+
+            0.40 hoarder    only a queen is worth a slot; the honest "off" position
+            1.00 measured   defends knights and up, takes free material — the baseline
+            1.45 liberal    defends bishops and up, will buff prophylactically
+            2.00 reckless   fires on almost anything the absolute rules permit
+
+        Note the dial has a FLOOR it cannot cross: at 2.00 the defensive bar is still
+        1.5, so a hanging PAWN (gold value 1) never triggers SAVE at any setting.
+
+        A bar of 3 becomes 7.5 / 3.0 / 2.07 / 1.5 across those four. It also scales the
+        roll probabilities, the veto tolerance (25cp → 300cp) and the shop's gold floor
+        ($10 → $0). Set per difficulty in GameConfig (Section 9).
+
+    THE TWO ABSOLUTE RULES — THE DIAL CANNOT OVERRIDE THESE
+        RULE A — A GOLD-PAYOFF POWER-UP MUST OUT-EARN ITS OWN PRICE.
+            Negate and Multiply pay out in gold and nothing else, which makes them
+            directly comparable to their shop price. With Negate at $4 and gold values
+            P1 N3 B3 R5 Q9, NEGATE CAN ONLY EVER LAND ON A ROOK OR A QUEEN. That single
+            line is the whole fix for the $4-to-deny-$1 bug.
+            Defensive and offensive buffs are deliberately EXEMPT: their payoff is
+            material, worth far more than its gold price. Judging Shield by Rule A
+            would jam the rack shut, which is the opposite failure.
+
+        RULE B — THE CHEAPEST POWER-UP THAT FULLY SOLVES THE PROBLEM WINS.
+            Ground ($3) makes a piece uncapturable. Shield ($5) does that AND leaves it
+            mobile. Teleport ($8) removes it from the square. For "my rook is attacked"
+            all three work, so the bot spends the Ground. Implemented by emitting save
+            proposals in ascending cost order; the caller takes the first that survives
+            the veto and marks the square handled so nothing else touches it.
+
+    THE RULES, IN THEIR HARDCODED PRECEDENCE ORDER
+        These ranks are fixed constants and are NOT scaled by the dial. The dial decides
+        how OFTEN a rule fires, never which rule outranks which. Ties break on value at
+        stake, then on cost (Rule B).
+
+        100  SAVE          a piece of ours is hanging; Ground/Shield stops it being taken
+        100  ESCAPE        ...or Teleport walks it off the square (3rd rung of the ladder)
+         90  WIN MATERIAL  Capture/Phase geometry unlocks a safe capture we can't reach
+         70  MULTIPLY      we are capturing anyway — get paid double for it
+         55  SUPER PAWN    a pawn far enough up the board to justify $10 permanently
+         50  REVIVE        buy a dead piece back (terminal — ends the turn)
+         40  NEGATE        the piece is doomed regardless; deny the payout
+         30  CHEAT         disrupt an enemy threatening something worth the $15
+         10  PROPHYLACTIC  nothing threatened, fat bank, a Defense slot ready — buff
+                           anyway. (It checks for a ready Ground OR Shield, not a full
+                           rack.)
+
+        "HANGING" IS A REAL TEST, NOT JUST "ATTACKED". A piece qualifies when it is
+        attacked AND (undefended, OR the cheapest attacker is worth less than it). A
+        defended knight attacked by a rook is fine and buffing it wastes a slot.
+
+        ATTACK IS MEASURED BY REAL MOVES, DEFENCE BY GEOMETRY. "Can you take me" uses
+        game.get_legal_moves — a Shielded enemy still guards squares by design but its
+        captures are stripped, so it cannot actually take anything. "Would I recapture"
+        uses the raw threat scan, because the square will be OCCUPIED by then, which is
+        what turns a friendly pawn's diagonal into a capture it does not yet have. The
+        asymmetry is deliberate; using one model for both was a bug.
+
+        PROPHYLACTIC is off entirely below aggression 1.30 and needs $18 in the bank.
+        At measured and below, HOLDING IS THE RIGHT CALL and the bot holds.
+
+    THE SHOP
+        Needs-based weights computed from the board every turn, replacing the static
+        BUY_WEIGHTS dice roll. An empty Defense rack adds +5 to Ground. Multiply gets
+        a standing +4 because it pays for itself on ANY capture. Negate drops to zero
+        when we own no rook or queen for it to protect (Rule A makes it unplayable
+        otherwise). Super Pawn is zero without an advanced pawn; Capture/Phase are zero
+        when the enemy has nothing big left to reach; Cheat only when genuinely rich.
+        The dial then skews the whole table by price, so a hoarder reaches for cheap
+        items and a reckless bot for expensive ones.
+
+        GOLD FLOOR: the shop must leave gold_floor() in the bank ($5 at measured). The
+        old GOLD_RESERVE was 0 and the bot bought until broke. Do NOT raise this much —
+        the observed failure was UNDER-USE, not over-buying, and a high floor jams the
+        rack shut in the opening, which is the same bug wearing a different hat.
+
+    THE VETO PASS (UberbotStrategy._choose_primary)
+        Walks proposals in rank order, accepts at most one per CLASS, and skips any
+        whose target square a higher-ranked rule already claimed — that is what stops
+        the bot Grounding a rook and then also Negating it.
+
+        THE EVALUATION'S OWN BONUSES ARE SUBTRACTED BEFORE COMPARING. _evaluate pays a
+        flat SHIELD_BONUS (120) / GROUND_BONUS (60) for merely carrying the buff, and
+        the search cannot model expiry, so every Defense trial would otherwise start a
+        tolerance-width ahead and sail through on the bonus alone. That matters most
+        for Shield, which STRIPS the carrier's own captures — shielding a defender
+        silently removes the recapture holding a square. Super Pawn's premium is NOT
+        subtracted: that upgrade is permanent and the value is real.
+
+        ZERO-DELTA PROPOSALS SKIP SCORING. Negate changes neither the board nor the
+        move, so its trial would score exactly the plain move every time and the veto
+        is mathematically incapable of rejecting it. Scoring it burns a candidate slot
+        to learn nothing. Rule A is its gate.
+
+        BOUNDED BY WALL CLOCK, NOT JUST COUNT. begin_scoring_budget() hands the pass a
+        FRESH full MAX_THINK_MS on top of the one best_move just spent, so plan_turn's
+        natural worst case is ~2× the think budget — which would blow straight through
+        the 4-second turn. The pass is therefore bounded by GameConfig's
+        bot_plan_budget_ms(), clamped to 250–900ms: a slow deep search shortens the
+        VETO, never the turn.
+
+    THREE BUGS THE REWRITE FIXED THAT WERE NOT THE REPORTED ONE
+        - MULTIPLY IGNORED ITS OWN LIABILITY. The modifier survives the opponent's
+          reply and _capture_payout reads the VICTIM's modifier first, so a Multiplied
+          piece that gets taken pays the OPPONENT double. Buffing a queen to turn a $1
+          capture into $4 and then losing her hands back $18 instead of $9 — a net loss
+          on a rule advertising a guaranteed gain. score_turn cannot catch it either:
+          _turn_income_cp is deliberately blind to opponent income. The rule now only
+          Multiplies a capturer that is safe where it lands.
+        - CHEAT COULD DELETE THE BOT'S OWN QUEEN. get_cheat_moves does not exclude the
+          cheater's own pieces and execute_cheat_move captures whatever is standing on
+          the destination for no gold. The old fallback took an arbitrary destination
+          when no empty one existed. It now holds the Cheat instead — and it HAS to be
+          caught in the rule, because plan_turn commits the relocation to board_state
+          before best_move runs, so the search never gets to compare against not
+          cheating at all.
+        - REVIVE WHILE IN CHECK SILENTLY NO-OPPED. _bot_revive refuses outright when
+          the bot is in check; the action would fail, the turn would never swap, and
+          game.gd would sit on the position until its fallback fired. Now guarded.
+
+    Variety: randomizes among root moves within OPENING_VARIETY_CP (35cp) of the best
+        during the first OPENING_PLIES (6) half-moves; exact and sharp thereafter.
+        The opening book is the primary variety source; this is the backstop.
+
+    Opening book consulted FIRST. In book the bot skips the rule book entirely (nothing
+        needs shielding on move two, and it makes the opening instant) but still BUYS,
+        so it builds its kit during the opening. Cheat is skipped outright while in
+        book — relocating a piece produces a position no book line contains and drops
+        both sides out of theory immediately.
+
+    OBSERVABILITY — READ THE CONSOLE
+        One line at load: the tier, the aggression value, the gold floor, the veto
+        tolerance and the plan budget. Then one block per bot turn naming EVERY rule
+        that fired, in the rule book's own words ("Rook worth 5 is hanging — Ground is
+        the cheapest thing that saves it"), plus anything the search vetoed and by how
+        much. If the bot does something you don't like, that block names the rule to go
+        edit. This is the feature that makes the policy tunable instead of mysterious.
+
+8.5 TAP-IN AND THE BOT                                                   [BUILT]
+
+    Tap-in replaced Revive as a terminal action, so it is a RULE in
+    UberbotPowerupPolicy, not a search candidate. {"kind":"revive", index, tile} became
+    {"kind":"tapin", bench_index, square} in _apply_turn / _revert_turn, and
+    _rule_revive became _rule_tapin at the same rank (50). It keeps `"reviving": true`
+    semantics — the flag name is legacy and now means "this proposal IS the whole
+    turn"; the strategy's veto loop already treated a terminal proposal that way and
+    needed no change.
+
+    ONE THING THE UNDO HAS TO GET RIGHT that revive did not: a tap-in is a TWO-SIDED
+        bench edit. The incoming piece is removed at `idx` and the outgoing one is
+        APPENDED at the end, so _revert_turn pops the tail first and only then
+        reinserts at `idx` — reversing that order silently corrupts every bench index
+        above the swap, inside a search that unmakes thousands of times a turn.
+
+    DELETED: _safe_revive_tile and the starting-square scan. Tap-in has
+        no placement search — the square is wherever the outgoing piece stood.
+
+    WHAT NEEDED CARE: the candidate space is bench × own-board-pieces, up to 15 × 15.
+        Filter it INSIDE THE RULE, before anything reaches the veto pass — the pass
+        scores at most 8 proposals and is wall-clock bounded, so an unfiltered list
+        would simply crowd out every other rule. Propose only:
+            UPGRADES — value_in > value_out, affordable, sub budget remaining
+            RESCUES  — the outgoing piece is hanging (the real test, see 8.4) and
+                       worth >= bar(3)
+        AS BUILT: the filter runs inside _rule_tapin, eligibility comes from
+        game._tapin_targets() rather than being re-derived, and the survivors are
+        sorted by stake and hard-capped at TAPIN_MAX_PROPOSALS (5). The gold_floor()
+        check the revive rule applied is kept.
+
+    The sub budget enters the bot's model as a scarce resource, not just a legality
+        check: with one sub left, the bar for spending it rises. AS BUILT, scarcity =
+        SUBS_PER_MATCH / subs_left scales BOTH bars (TAPIN_UPGRADE_BASELINE and
+        TAPIN_RESCUE_BASELINE) and the gold-floor test — the cost CHARGED is untouched,
+        only the bar for spending it moves.
+
+8.6 DIFFICULTY, THE DJ BOARD, AND PERSONALITIES
+
+    [BUILT] DIFFICULTY IS NOW TWO DIALS, RUNNING IN OPPOSITE DIRECTIONS.
+        From GameConfig.DIFFICULTY_PRESETS, read in _init:
+
+            tier      depth   think_ms   aggression
+            Easy        2        250        2.00   reckless
+            Normal      4        800        1.45   liberal
+            Hard        6       1800        1.00   measured
+            Über        8       2400        1.00   measured
+
+        depth/think_ms is the STRENGTH dial. aggression is the FLAMBOYANCE dial. They
+        run opposite ON PURPOSE: depth is what makes the bot hard to beat, spending is
+        what makes it fun to watch, and an Easy bot that plays shallow chess quietly is
+        just weak while an Easy bot throwing power-ups around is a character.
+
+        Über's think_ms dropped 3000 → 2400 in this revision so the veto pass fits
+        inside the 4-second turn (6.5, and Section 9's timing contract). At depth 8
+        with iterative deepening that costs well under a ply.
+
+    [BUILT] THE DJ BOARD — SHIPPED, as one dial rather than twelve.
+        The previous plan was to move PU_SEARCH_MARGIN, MARGIN_COST_COEF,
+        MAX_TARGETS_PER_TYPE, USE_PROB, BUY_WEIGHTS, SPEND_TIERS, FORCED_USE_* and the
+        value thresholds to runtime vars behind a debug panel. The rewrite went
+        further: it DELETED all of them. Every one existed to nudge a scorer that could
+        not price what it was scoring (8.4). With rules doing the deciding, the twelve
+        knobs collapse into `aggression`, and the thing that made the bot mysterious —
+        not knowing WHICH knob produced a decision — is solved instead by the per-turn
+        reason log, which names the rule outright.
+
+        STILL WORTH DOING: a live in-match control for the dial. It is now a single
+        float on UberbotPowerupPolicy with a set_aggression() setter, so a debug
+        hotkey that cycles hoarder → measured → liberal → reckless mid-game is a few
+        lines and would make a playtest session enormously more informative.
+
+    [DESIGN] PERSONALITIES INSTEAD OF TIERS — the stretch goal, and the better product,
+        and now much closer than it was.
+        Same engine, different rules. The single dial got the architecture most of the
+        way; what personalities need on top is PER-CLASS dials — separate aggression
+        floats for Defense / Agility / Attack / Economy / Uber, replacing the one
+        global. bar() already takes the value through a single function, so this is a
+        dictionary lookup at that one call site plus a per-class table.
+
+            THE BROKER  — Economy-heavy. Buys everything, hoards, then dumps.
+                          High Economy dial, high gold floor, low Attack.
+            THE BRUISER — Attack only. Capture and Super Pawn, forward PST bias.
+            THE GHOST   — Agility. Lives on Phase and Teleport, avoids trades.
+            THE FIXER   — Uber-heavy. Cheat and Tap-in, disruption over material.
+
+        Each is a shippable unit with a name and a face. "Play The Ghost" is better
+        product than "play Hard", and it turns endless bot refinement into a finite
+        list of characters.
+
+8.7 DEFERRED WORK (do not start these)
+
+    Slice 3 — coordinated combos (Cheat→capture, Shield→advance). PARTLY OBSOLETE: the
+        veto loop already accepts one proposal per class per turn, so Ground + Multiply
+        + move in one turn happens today. What is still missing is DEPENDENT combos,
+        where the second action is only correct BECAUSE of the first — that needs a
+        rule that proposes a pair, not two rules that happen to co-fire. Deferred:
+        invisible to players.
+    Slice 4 — teach the rule book to hunt/defend the King, lifting the King-targeting
+        guards in _hanging_pieces / _rule_multiply / plan_cheat. BLOCKED on Uber-check
+        (win-condition Slice 3) existing.
+    Gold income deeper in search — a root-level income delta already lands in
+        score_turn; make/unmake income + gold-in-hash is deferred indefinitely. NOTE:
+        this matters less than it did. The rules now price gold decisions directly in
+        gold (Rule A), so the search no longer needs to understand income to get
+        Negate and Multiply right.
+    OPPONENT income in score_turn. _turn_income_cp scores only the bot's own actions,
+        which is why _rule_multiply has to guard its own liability by hand (8.4). If
+        this ever lands, that guard can relax. Low priority.
+    In-search modifier expiry + gold/slots in the Zobrist hash once power-up state
+        varies at non-root plies. Deferred. This is the reason _choose_primary has to
+        subtract SHIELD_BONUS/GROUND_BONUS by hand before the veto comparison — the
+        search overvalues a buff it cannot see expire.
+
+================================================================================
+9. MATCH CONFIGURATION (GameConfig.gd — AUTOLOAD)                        [BUILT]
+================================================================================
+
+    Singleton "GameConfig", survives scene swaps. main_menu.gd writes it; game.gd,
+    uber_bot.gd and UberbotStrategy.gd read it in _ready() / _init().
+
+    Mode enum: TWO_PLAYER · VS_BOT · MULTIPLAYER
+    Bot settings (VS_BOT): bot_color / player_color (roll_bot_sides() randomizes each
+        match).
+    Difficulty enum: EASY · NORMAL · HARD · UBER. DIFFICULTY_PRESETS maps each tier to
+        {depth, think_ms, aggression, label}; bot_max_depth() / bot_think_ms() /
+        bot_powerup_aggression() / difficulty_label() accessors. See 8.6 for the table
+        and for why the strength and flamboyance dials run opposite directions.
+    Bot turn pacing: BOT_TURN_SECONDS (4.0), BOT_PACING_RESERVE_MS (700),
+        bot_turn_seconds() and bot_plan_budget_ms() accessors.
+    Helpers: set_two_player(), set_vs_bot(diff), set_multiplayer(), is_bot_match(),
+        is_multiplayer().
+
+    THE TIMING CONTRACT LIVES HERE, AND IT IS LOAD-BEARING
+        BOT_TURN_SECONDS has two consumers that must never disagree: game.gd paces the
+        bot's action list against it, and UberbotStrategy sizes its veto pass to fit
+        inside it. They previously held separate copies of the number, which is exactly
+        how such a pair drifts. GameConfig is the single authority; both read it at
+        startup and both keep a local fallback only for an editor-direct launch with no
+        autoload.
+
+        bot_plan_budget_ms() = BOT_TURN_SECONDS×1000 − BOT_PACING_RESERVE_MS = 3300ms.
+        That is the total plan_turn may block. The rest is visible pacing.
+
+            tier    think_ms   veto pass   planning ends   pacing left
+            Easy       250        900          1150ms         2850ms
+            Normal     800        900          1700ms         2300ms
+            Hard      1800        900          2700ms         1300ms
+            Über      2400        900          3300ms          700ms
+
+        IF YOU RAISE ANY think_ms, CHECK THIS TABLE. The veto pass is clamped to a
+        250ms floor, so an over-long think does not skip the blunder check — it
+        overruns the turn instead, and game.gd's pacing collapses into a single frame.
+        The floor is deliberate: a blunder is permanent, a 200ms overrun is not.
+
+    ACCESSORS, NOT BARE CONSTS. game.gd reads bot_turn_seconds() via has_method rather
+        than `"BOT_TURN_SECONDS" in cfg`, because the `in` operator does NOT see
+        GDScript constants — they are not properties — and the check would silently
+        fail closed to the local fallback.
+
+    NOTE: GameConfig is PER-MATCH state and is overwritten every time a game starts.
+    Theme and FX-speed preferences must NOT live here — they belong in ThemeManager /
+    ConfigFile (Section 7), which have a per-install lifetime.
+
+    [DESIGN] Tap-in adds SUBS_PER_MATCH here (proposed 3), so it can differ by mode.
+
+================================================================================
+10. MAIN MENU & OPTIONS (main_menu.gd)
+================================================================================
+
+10.1 MAIN MENU                                                           [BUILT]
+
+    Project's Main Scene. Three full-rect CenterContainer pages toggled by visibility
+    (no scene changes). UI built entirely in GDScript over a dimmed-chessboard
+    backdrop (an 8×8 checker baked to a 512px texture, blurred and dimmed by a small
+    binomial shader); each page is a VBoxContainer of 320×56 buttons.
+
+    Page 1 — Main:       Play Local · Multiplayer · Options · Credits · Quit
+    Page 2 — Local:      Play 2-Player · Play Uber Bot · ← Back
+    Page 3 — Difficulty: Easy · Normal · Hard · Uber · ← Back
+
+    Play 2-Player → GameConfig.set_two_player(), load Game.tscn.
+    Play Uber Bot → difficulty page; a tier calls GameConfig.set_vs_bot(diff)
+        (randomizes sides), load Game.tscn.
+    Multiplayer → GameConfig.set_multiplayer(), load Game.tscn; game.gd shows the
+        lobby and opens the relay in _ready().
+    Quit → get_tree().quit().
+
+    Typography: the "ÜBERCHESS" wordmark uses Poxast (its own native cube-style "Ü").
+        Everything else — page headings and buttons — uses Merchant Copy for one
+        consistent voice. Because Merchant Copy has no "Ü", the bot labels use a plain
+        "U" ("Play Uber Bot", "Uber"). CoralPixels is kept loaded only as a dormant
+        glyph fallback on the wordmark. Poxast is shared with all in-game UI text.
+
+10.2 OPTIONS SCREEN                                                     [DESIGN]
+
+    PROMOTED FROM STUB TO LOAD-BEARING. It has been a print-only placeholder in
+    _on_options_pressed since the beginning. Three separate workstreams now route
+    through it, so it is no longer deferrable:
+
+        THEME       — preset picker with a LIVE PREVIEW. The preview must show a
+                      board corner with pieces AND at least two power-up states on
+                      them, because a theme that looks handsome but makes Ground and
+                      Negate indistinguishable is a broken theme (Section 7).
+        FX SPEED    — Full / Reduced / Off. Ship it with the FX system, not after
+                      (Section 6.5).
+        VOLUME      — master / SFX / music. Sound is otherwise unspecified in this
+                      document and needs its own pass.
+        BOARD COORDS, and any later accessibility toggles.
+
+    Built as a fourth page in main_menu.gd's existing visibility-toggle pattern —
+    no scene change, consistent with the other three. It must ALSO be reachable
+    mid-game (pause overlay), or theme switching means quitting to the menu.
+
+    Persistence: ConfigFile in user://uberchess.cfg, owned by ThemeManager for theme
+    keys and by a small SettingsManager (or the same autoload) for the rest.
+
+10.3 CREDITS SCREEN                                                     [DESIGN]
+
+    Still a stub. Low effort, low risk, and required for store submission. Same page
+    pattern as above.
+
+================================================================================
+11. MULTIPLAYER BACKEND — PHASE 1 (LIVE)                                 [BUILT]
+================================================================================
+
+    Why a relay, not ENet: ENet needs a host (exposes an IP), doesn't work with web
+    export, and has no path to matchmaking/accounts. A central WebSocket relay both
+    players connect to was chosen instead — it forwards messages without understanding
+    chess. All move validation stays in the Godot clients for Phase 1 (trusted peers);
+    Phase 2 moves it server-side.
+
+    Server stack: Node.js v24.16.0, ws ^8.18.0, server.js (~60 lines), hosted on
+        Railway (auto-deploys on git push to main).
+    Endpoints:
+        HTTPS https://uberchess-relay-production.up.railway.app (shows "Upgrade
+            Required" in a browser — correct, it's WS-only).
+        WSS   wss://uberchess-relay-production.up.railway.app (use in Godot).
+    Repo: https://github.com/HDChvoy/uberchess-relay
+
+    Message protocol (JSON):
+        Client → Server:
+            { "type": "CREATE_ROOM" }  → server assigns a 6-char code, replies
+                ROOM_CREATED; creator is White.
+            { "type": "JOIN_ROOM", "code": "…" } → joiner is Black; fires MATCH_START
+                to both. ERROR if code invalid or room full.
+            Pure-relay actions, forwarded unchanged (server does not validate chess):
+                { "type": "MAKE_MOVE",        "from":[x,y], "to":[x,y] }
+                { "type": "USE_POWERUP",      "item":"Shield", "target":[x,y] }
+                { "type": "BUY_ITEM",         "item":"Ground" }
+                { "type": "TAP_IN",           "bench_index":0, "square":[x,y] }
+                { "type": "CHEAT_MOVE",       "from":[x,y], "to":[x,y] }
+                { "type": "PROMOTION_CHOSEN", "piece_type":"Queen" }
+                { "type": "REMATCH" }  → relayed to the opponent; when both sides send
+                    it, each client resets to a fresh game in the same room.
+        Server → Client:
+            { "type": "ROOM_CREATED",  "code":"…" }
+            { "type": "MATCH_START",   "your_color":"White"|"Black" }
+            { "type": "OPPONENT_DISCONNECTED" }
+            { "type": "ERROR",         "message":"Room not found"|"Room is full" }
+
+    [BUILT] TAP-IN PROTOCOL CHANGE. REVIVE has been replaced by TAP_IN (see the
+        action list above). The relay is a dumb forwarder, so this was a CLIENT-ONLY
+        change and the server needed no deploy. But there is NO VERSION NEGOTIATION
+        in Phase 1: a client speaking TAP_IN and a client still speaking REVIVE will
+        silently desync rather than error. Both clients MUST ship in lockstep — an
+        old build talking to a new one is the failure case to watch for. This is a good argument for adding
+        a protocol-version field to CREATE_ROOM / JOIN_ROOM before the next wire
+        change lands — it is cheap now and expensive after the App Store release.
+
+    Room lifecycle: rooms live in an in-memory Map, created on CREATE_ROOM, deleted
+        when either player disconnects (no persistence; reconnection is Phase 2).
+    Cost: Railway's $5/mo free credit covers it — a routing-only relay uses
+        ~$0.05–0.10/mo at launch scale.
+
+    Client integration (game.gd):
+        1. WebSocketPeer opened in _ready() when is_multiplayer; _process() polls each
+           frame, detecting OPEN/CLOSED once and draining packets.
+        2. Lobby overlay (_build_lobby_ui): Create Room (shows the code), a 6-char code
+           field + Join Room (Enter submits), live status, Back-to-Menu. Buttons enable
+           on socket OPEN.
+        3. send_to_server() — single outbound chokepoint. No-ops unless online with an
+           OPEN socket AND not replaying a remote action (net_applying_remote stops
+           echo). Injected into execute_move, apply_powerup, buy, _do_revive,
+           execute_cheat_move, and promotion.
+        4. Inbound routing (_net_route) + ordered replay: control messages (ROOM_CREATED
+           / MATCH_START / ERROR / OPPONENT_DISCONNECTED / REMATCH) and PROMOTION_CHOSEN
+           handled immediately; chess actions queue in _net_inbox and drain one at a time
+           via _pump_inbox(), each fully awaited (animation included) before the next —
+           serializing remote coroutines to prevent board-mutation corruption.
+           PROMOTION_CHOSEN is handled out-of-band so a replay parked on await can't
+           deadlock the pump.
+        5. _apply_remote_action replays each opponent action by calling the SAME local
+           function the human uses, with net_applying_remote=true. Slot-consuming actions
+           reconstruct the slot via _find_ready_slot (the wire carries the item name).
+        6. Input gating: locked until MATCH_START (net_match_started); on the opponent's
+           turn, gated by current_turn != my_side across input/buy/powerup/revive.
+        7. Per-side board flip: MATCH_START sets my_side and board_flipped. A pure VIEW
+           transform (_disp) — board_state, move logic, and the wire always use LOGICAL
+           coords, so flipping can never desync. Shared with Vs-Bot so the human always
+           sits on the bottom.
+        8. OPPONENT_DISCONNECTED / lost connection → _show_net_notice ends the match
+           gracefully.
+        Rematch: when a game ends, _show_rematch_ui() offers Rematch / Return to Menu.
+           Rematch sends {"type":"REMATCH"} and sets rematch_local; the opponent's
+           REMATCH sets rematch_remote; when both are true _do_rematch() resets to the
+           opening position in the same room (colors kept, White to move), running
+           identically on both clients so no extra sync is needed.
+           [DESIGN] _do_rematch must also reset the per-match SUB BUDGET (3.2).
+
+    [DESIGN] FX AND THE NETWORK. Every animation added in Section 6 runs inside
+        _apply_remote_action too, because remote actions call the same local functions.
+        The inbox pump awaits each action fully before the next — so a long FX beat
+        does not corrupt state, but it DOES stall the queue. The Section 6.5 timing
+        budget is therefore a multiplayer correctness concern, not just a feel one.
+
+================================================================================
+12. MULTIPLAYER VISION — PHASE 2 (FUTURE)                               [DESIGN]
+================================================================================
+
+    Layers added on top of the same server without breaking existing clients:
+
+    Protocol versioning (do this FIRST — see Section 11): a version field on room
+        creation/join so wire changes fail loudly instead of desyncing.
+    Accounts + auth: REST register/login/profile; JWT sent with each WS connection;
+        persistent username, avatar, history.
+    Rating: Glicko-2, updated per ranked match; leaderboard endpoint.
+    Matchmaking: queue instead of room codes; pair within a rating band, widening
+        after a timeout.
+    History + replay: PostgreSQL records every move; a replay viewer steps through
+        past games.
+    Server-side validation (key milestone): port the GDScript validation
+        (get_safe_moves, is_in_check, …) into the server so illegal moves are rejected
+        before relay — the architectural requirement for a public platform.
+    Spectator mode: read-only WS clients subscribe to a room; server broadcasts moves.
+    Web client (optional): a browser client on the same server + REST, no Godot
+        required; Godot stays the mobile/desktop client.
+
+================================================================================
+13. ROADMAP
+================================================================================
+
+13.1 SEQUENCING — AND THE REASONING BEHIND IT
+
+    THE LOAD-BEARING CLAIM: build the FX SYSTEM BEFORE Tap-in and Themes, not after.
+    Both hook into it — Tap-in needs its bench-to-board crossing, Themes needs to own
+    the FX palette. Build Tap-in first and its animation gets written twice.
+
+    SECOND CLAIM: do NOT run Tap-in and the win-condition rework concurrently. Both
+    touch the terminal-action path in _finish_turn and both touch the bot's candidate
+    generator. Tap-in is smaller and player-facing. Land it alone.
+
+    THIRD CLAIM: presentation is the weakest link, and presentation is what gets the
+    game downloaded. iOS export is active in the backlog. Themes and FX are directly
+    store-facing work. Bot slices 3 and 4 are not.
+
+    ORDER:
+        1. FX & ANIMATION SYSTEM + Options shell     (Sections 6, 10.2)
+        2. TAP-IN                                     (Section 3.2)
+        3. THEMES                                     (Section 7)
+        4. Win-condition rework, Slices 2–4           (13.3)
+        5. Bot personalities: per-class dials  [stretch]  (Section 8.6)
+
+    REMOVED FROM THIS ORDER (Aug 26): "Bot slice 2 — Cheat into the search" is closed,
+    superseded by the power-up rule book (8.4), and "Bot DJ board" shipped with it.
+
+13.2 WORKSTREAM 1–3 CHECKLISTS
+
+    FX SYSTEM
+        [x] fx.gd skeleton — module, palette hook, FULL/REDUCED/OFF dial (6.2)
+            (res://fx/ scene convention still pending: the one ring effect is an inner
+            class, and moves to a scene as soon as a second effect wants it)
+        [x] Check alert: cast + persistent hold (6.7) — was missing from Section 6
+        [x] Knight leap: arc, 2 front flips, ground shadow, crash landing (6.8)
+        [ ] Piece-character movement for the other five pieces (6.8 OPEN)
+        [ ] Outline/rim shader — the single highest-value effect
+        [ ] Generic cast (particles + squash/stretch) on all 9 power-ups
+        [ ] Payoff channel: coin flight, shield shatter, Negate "$0", ground recoil
+        [ ] Bespoke: Cheat (jerky easing + desaturation), Teleport (implode/explode),
+            Super Pawn (the 1.2s transformation)
+        [ ] Delete MOD_TINTS; state now comes from the shader layer
+        [ ] Timing pass against a 3-action bot turn (6.5). NOTE: the gap is now
+            VARIABLE, not a fixed 1.5s — 233ms at Über, ~950ms at Easy. Cast beats
+            must scale to the gap they are given or be interruptible.
+        [ ] FX speed setting wired
+
+    TAP-IN                                                              [BUILT]
+        [x] Rename pass (3.2 "RENAMES THIS IMPLIES")
+        [x] Cost formula + delete piece_rules.revive_cost
+        [x] Sub budget: counter, gutter UI, _do_rematch reset
+            (no GameConfig entry — SUBS_PER_MATCH is a flat const in game.gd; a mode
+            dial was considered and dropped, see 3.2 AS BUILT)
+        [x] Swap execution + self-check rejection + Ground tap-out block
+        [x] has_moved = true on the incoming piece (castling-rights guard)
+        [x] Pawn promotion-rank block
+        [x] Delete is_revived and its capture-time branch
+        [x] Wire protocol REVIVE → TAP_IN, both clients in lockstep
+        [x] Bot: tapin action kind; replace _rule_revive with _rule_tapin in
+            UberbotPowerupPolicy at rank 50; upgrade/rescue filter INSIDE the rule
+            (8.5); scarcity term; delete _safe_revive_tile
+        [ ] FX: bench-to-board crossing — the ONLY piece still open; waits on fx.gd
+
+    THEMES
+        [ ] ChessTheme resource + ThemeManager autoload
+        [ ] Route the ~4 hardcoded piece-art paths through piece_path()
+        [ ] draw_board() → square_color()
+        [ ] Font paths from theme
+        [ ] fx_colors owned by theme
+        [ ] ConfigFile persistence in user://
+        [ ] First wave: Rainbow / Noir / Neon / Cathedral / Terracotta — SHARED ART
+        [ ] Options live preview showing power-up states, not just an empty board
+
+13.3 WIN-CONDITION REWORK — KING AS A CAPTURABLE PIECE
+
+    Slice 1 (king-capture primitive) landed and dormant. Scheduled AFTER Tap-in.
+    Slice 2 — sudden death + per-piece finisher animation: convert the checkmate
+        branch in _finish_turn to a forced ceremonial King capture through the
+        primitive. Note this is now also an FX deliverable and should reuse Section 6.
+    Slice 3 — Uber-check: King-threat via READY power-up geometry (Phase / Cheat /
+        Capture); King gains Shield/Ground/Teleport defense; check logic widens to
+        board + ready-slot geometry.
+    Slice 4 — teach the bot's power-up policy to hunt/defend the King. Lift the
+        King-targeting guards in UberbotPowerupPolicy (_hanging_pieces skips the King,
+        _rule_multiply refuses a King mover, plan_cheat skips King attackers).
+        Blocked on Slice 3.
+
+13.4 STANDING BACKLOG
+
+    Sound design — entirely unspecified in this document and increasingly overdue.
+        Every FX beat in Section 6 wants a paired sound, and building the FX system
+        without leaving hooks for audio means touching all of it twice. AT MINIMUM,
+        give fx.play() a sound key parameter now even if it plays nothing yet.
+    Super Pawn art / app icon — the Super Pawn is the central visual identity and the
+        app icon; final asset pass pending. Blocks store submission.
+    iOS / App Store — Godot → Xcode → App Store export. Fairy-Stockfish via GDExtension
+        remains a stretch goal for a stronger base engine option (and is arguably
+        redundant now that the bot is frozen at a satisfying strength).
+    Protocol versioning — see Sections 11 and 12. Cheap now, expensive after release.
+    game.gd is 2,839 lines. It has earned a split: board/render, shop/economy,
+        network, and input are four clean seams. The fx.gd extraction is the first cut;
+        do not let it be the last.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
